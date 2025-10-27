@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import math
+
 import numpy as np
 import cv2
 
@@ -173,6 +175,8 @@ def paste_text_rotated(
     text_qimage: QImage,
     center: Tuple[int, int],
     angle_deg: float,
+    *,
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> None:
     """
     Colle le QImage (texte) dans la frame BGR autour de `center` avec rotation.
@@ -184,6 +188,19 @@ def paste_text_rotated(
     """
     pane_bgra = _qimage_to_bgra_numpy(text_qimage)  # HxWx4 (BGRA)
     h, w = pane_bgra.shape[:2]
+
+    if target_size is not None:
+        tw, th = target_size
+        tw = int(round(tw))
+        th = int(round(th))
+        if tw > 0 and th > 0 and w > 0 and h > 0:
+            scale = min(tw / float(w), th / float(h))
+            if scale > 0 and not math.isclose(scale, 1.0, rel_tol=1e-3, abs_tol=1e-3):
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                pane_bgra = cv2.resize(pane_bgra, (new_w, new_h), interpolation=interp)
+                h, w = pane_bgra.shape[:2]
 
     # Construire image plus grande pour éviter le crop lors de la rotation
     diag = int(np.ceil(np.hypot(h, w)))
@@ -220,6 +237,8 @@ def draw_speed_overlay(
     unit: str = "mph",
     decimals: int = 0,
     text: Optional[str] = None,
+    *,
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> str:
     """
     Dessine la vitesse formatée sur la frame et retourne le texte affiché.
@@ -238,5 +257,5 @@ def draw_speed_overlay(
     if text is None:
         text = format_speed_text(value, unit=unit, decimals=decimals)
     pane = render_text_pane_qt(text, style)
-    paste_text_rotated(frame_bgr, pane, center, angle_deg)
+    paste_text_rotated(frame_bgr, pane, center, angle_deg, target_size=target_size)
     return text
