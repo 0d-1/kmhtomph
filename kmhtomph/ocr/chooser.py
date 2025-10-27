@@ -9,6 +9,12 @@ import numpy as np
 from ..constants import DEFAULT_ANTI_JITTER, AntiJitterConfig
 
 
+def _reset_memory(state: AntiJitterState) -> None:
+    """Oublie la dernière valeur acceptée et vide la fenêtre médiane."""
+    state.last_kmh = None
+    state.win = _MedianWindow(state.config.window_size)
+
+
 class _MedianWindow:
     def __init__(self, size: int):
         self.size = int(size)
@@ -60,6 +66,7 @@ def choose_best_kmh(
         state.miss_streak += 1
         if state.last_kmh is not None and state.miss_streak <= int(config.hold_max_gap_frames):
             return state.last_kmh
+        _reset_memory(state)
         return None
 
     median_ref = state.win.median()
@@ -76,6 +83,7 @@ def choose_best_kmh(
             state.miss_streak += 1
             if state.last_kmh is not None and state.miss_streak <= int(config.hold_max_gap_frames):
                 return state.last_kmh
+            _reset_memory(state)
             return None
 
     state.last_kmh = float(best_v)
