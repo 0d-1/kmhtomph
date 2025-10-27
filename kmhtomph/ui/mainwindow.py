@@ -5,6 +5,7 @@ barre de progression + raccourcis, extraction ROI par homographie exacte.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import numpy as np
@@ -31,6 +32,7 @@ from ..video.exporter import export_video, ExportParams
 from ..video.overlay import OverlayStyle, draw_speed_overlay, format_speed_text
 from .canvas import VideoCanvas
 from .settings import SettingsDialog
+from .overlaystyle import OverlayStyleDialog
 
 
 def _extract_roi_from_corners(
@@ -74,6 +76,8 @@ class MainWindow(QMainWindow):
         self.ocr_mode = "auto"  # "auto" | "sevenseg" | "tesseract"
 
         self.overlay_style = OverlayStyle()
+        self._last_overlay_text: Optional[str] = None
+        self._loading_overlay_settings = False
         self.show_debug_thumb = DEFAULT_SHOW_DEBUG_THUMB
         self.debug_thumb_size = DEFAULT_DEBUG_THUMB_SIZE
 
@@ -89,6 +93,12 @@ class MainWindow(QMainWindow):
         # --- UI ---
         self.canvas = VideoCanvas(self)
 
+        self._loading_overlay_settings = True
+        self.overlay_style = self._load_overlay_style(self.overlay_style)
+        self._set_overlay_text(None, allow_placeholder=True)
+        self._load_overlay_rect()
+        self._loading_overlay_settings = False
+
         self.lbl_kmh = QLabel("-- km/h", self)
         self.lbl_mph = QLabel("-- mph", self)
         for l in (self.lbl_kmh, self.lbl_mph):
@@ -101,6 +111,9 @@ class MainWindow(QMainWindow):
         self.btn_open = QPushButton("Ouvrir…", self)
         self.btn_play = QPushButton("Lecture", self)
         self.btn_export = QPushButton("Exporter…", self)
+        self.btn_overlay = QPushButton("Tracer zone de sortie", self)
+        self.btn_overlay.setCheckable(True)
+        self.btn_overlay_style = QPushButton("Style du texte…", self)
 
         self.chk_debug = QCheckBox("Vignette debug", self)
         self.chk_debug.setChecked(self.show_debug_thumb)
@@ -129,6 +142,8 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.btn_open)
         top_bar.addWidget(self.btn_play)
         top_bar.addWidget(self.btn_export)
+        top_bar.addWidget(self.btn_overlay)
+        top_bar.addWidget(self.btn_overlay_style)
         top_bar.addSpacing(20)
         top_bar.addWidget(QLabel("Mode OCR:", self))
         top_bar.addWidget(self.mode_combo)
@@ -156,14 +171,20 @@ class MainWindow(QMainWindow):
         self.btn_open.clicked.connect(self._on_open)
         self.btn_play.clicked.connect(self._on_toggle_play)
         self.btn_export.clicked.connect(self._on_export)
+        self.btn_overlay.toggled.connect(self._on_toggle_overlay_mode)
+        self.btn_overlay_style.clicked.connect(self._on_edit_overlay_style)
 
         # slider signals
         self.slider.sliderPressed.connect(self._on_seek_start)
         self.slider.sliderReleased.connect(self._on_seek_end)
         self.slider.valueChanged.connect(self._on_seek_change)
 
+        self.canvas.on_overlay_changed.connect(self._on_overlay_rect_changed)
+
         # menu
         self._create_menu()
+
+        self._update_overlay_mode_button()
 
         self.resize(1000, 740)
 
@@ -195,6 +216,120 @@ class MainWindow(QMainWindow):
         view_menu.addAction(act_fit_roi)
 
     # ------------- Utilitaires -------------
+
+    def _on_toggle_overlay_mode(self, checked: bool) -> None:
+        self.canvas.set_active_shape("overlay" if checked else "roi")
+        self._update_overlay_mode_button()
+
+    def _update_overlay_mode_button(self) -> None:
+        if self.btn_overlay.isChecked():
+            self.btn_overlay.setText("Zone de sortie (édition)")
+        else:
+            self.btn_overlay.setText("Tracer zone de sortie")
+
+    def _on_edit_overlay_style(self) -> None:
+        dlg = OverlayStyleDialog(self, style=self.overlay_style)
+        if dlg.exec_():
+            self.overlay_style = dlg.result_style
+            self._save_overlay_style()
+            self._set_overlay_text(self._last_overlay_text, allow_placeholder=True)
+
+    def _set_overlay_text(self, text: Optional[str], *, allow_placeholder: bool = False) -> None:
+        display = text
+        if text:
+            self._last_overlay_text = text
+        else:
+            display = self._last_overlay_text
+        if display is None and allow_placeholder:
+            display = "-- mph"
+        self.canvas.set_overlay_preview(display, self.overlay_style)
+
+    @staticmethod
+    def _rgba_to_string(rgba: tuple[int, int, int, int]) -> str:
+        return "#{:02X}{:02X}{:02X}{:02X}".format(*rgba)
+
+    @staticmethod
+    def _string_to_rgba(value: Optional[str]) -> Optional[tuple[int, int, int, int]]:
+        if not value:
+            return None
+        txt = value.strip()
+        if not txt:
+            return None
+        if txt.startswith("#"):
+            txt = txt[1:]
+        try:
+            if len(txt) == 6:
+                r = int(txt[0:2], 16)
+                g = int(txt[2:4], 16)
+                b = int(txt[4:6], 16)
+                a = 255
+            elif len(txt) == 8:
+                r = int(txt[0:2], 16)
+                g = int(txt[2:4], 16)
+                b = int(txt[4:6], 16)
+                a = int(txt[6:8], 16)
+            else:
+                return None
+        except ValueError:
+            return None
+        return r, g, b, a
+
+    def _load_overlay_style(self, base: OverlayStyle) -> OverlayStyle:
+        style = base
+        family = self._settings.value("overlay/font_family", type=str)
+        if family:
+            style = replace(style, font_family=family)
+        size = self._settings.value("overlay/font_point_size", type=int)
+        if size:
+            style = replace(style, font_point_size=int(size))
+        text_color = self._string_to_rgba(self._settings.value("overlay/text_color", type=str))
+        if text_color:
+            style = replace(style, text_color_rgba=text_color)
+        bg_color = self._string_to_rgba(self._settings.value("overlay/bg_color", type=str))
+        if bg_color:
+            style = replace(style, bg_color_rgba=bg_color)
+        fill_value = self._settings.value("overlay/fill_opacity")
+        if fill_value is not None:
+            try:
+                fill = float(fill_value)
+            except (TypeError, ValueError):
+                fill = style.fill_opacity
+            else:
+                fill = max(0.0, min(1.0, fill))
+            style = replace(style, fill_opacity=fill)
+        return style
+
+    def _save_overlay_style(self) -> None:
+        self._settings.setValue("overlay/font_family", self.overlay_style.font_family)
+        self._settings.setValue("overlay/font_point_size", self.overlay_style.font_point_size)
+        self._settings.setValue("overlay/text_color", self._rgba_to_string(self.overlay_style.text_color_rgba))
+        self._settings.setValue("overlay/bg_color", self._rgba_to_string(self.overlay_style.bg_color_rgba))
+        self._settings.setValue("overlay/fill_opacity", float(self.overlay_style.fill_opacity))
+        self._settings.sync()
+
+    def _load_overlay_rect(self) -> None:
+        rect_str = self._settings.value("overlay/rect", type=str)
+        if not rect_str:
+            return
+        parts = rect_str.split(",")
+        if len(parts) != 5:
+            return
+        try:
+            cx, cy, w, h, ang = [float(p) for p in parts]
+        except ValueError:
+            return
+        self.canvas.set_overlay_rect(int(round(cx)), int(round(cy)), int(round(w)), int(round(h)), float(ang))
+
+    def _save_overlay_rect(self) -> None:
+        cx, cy, w, h, ang = self.canvas.get_overlay_rect()
+        rect_str = f"{cx},{cy},{w},{h},{ang}"
+        self._settings.setValue("overlay/rect", rect_str)
+        self._settings.sync()
+
+    def _on_overlay_rect_changed(self) -> None:
+        if self._loading_overlay_settings:
+            return
+        self._save_overlay_rect()
 
     def _format_hms(self, seconds: float) -> str:
         if seconds < 0 or not np.isfinite(seconds):
@@ -320,6 +455,8 @@ class MainWindow(QMainWindow):
         self.canvas.fit_roi_to_frame()
         self.lbl_kmh.setText("-- km/h")
         self.lbl_mph.setText("-- mph")
+        self._last_overlay_text = None
+        self._set_overlay_text(None, allow_placeholder=True)
         self.ocr.reset()
 
     def _on_toggle_play(self):
@@ -364,11 +501,14 @@ class MainWindow(QMainWindow):
 
         if kmh is not None:
             mph = kmh * KMH_TO_MPH
+            mph_text = format_speed_text(mph)
             self.lbl_kmh.setText(f"{kmh:.0f} km/h")
-            self.lbl_mph.setText(format_speed_text(mph))
+            self.lbl_mph.setText(mph_text)
+            self._set_overlay_text(mph_text)
         else:
             self.lbl_kmh.setText("-- km/h")
             self.lbl_mph.setText("-- mph")
+            self._set_overlay_text(None, allow_placeholder=True)
 
         # --- progression ---
         cur_ms = self.reader.get_pos_msec()
@@ -464,6 +604,7 @@ class MainWindow(QMainWindow):
         cx, cy, w, h, ang = self.canvas.get_roi()
         base_corners = self.canvas.get_roi_corners().copy()
         style = self.overlay_style
+        out_cx, out_cy, out_w, out_h, out_ang = self.canvas.get_overlay_rect()
 
         last_mph_value = {"value": None}
 
@@ -488,7 +629,15 @@ class MainWindow(QMainWindow):
                     value = float(text.split()[0])
                 except (ValueError, IndexError):
                     return
-            draw_speed_overlay(frame_bgr, value, (cx, cy), ang, style, text=text)
+            draw_speed_overlay(
+                frame_bgr,
+                value,
+                (out_cx, out_cy),
+                out_ang,
+                style,
+                text=text,
+                target_size=(out_w, out_h),
+            )
 
         total = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
         progress = QProgressDialog("Export en cours…", "Annuler", 0, total or 0, self)
