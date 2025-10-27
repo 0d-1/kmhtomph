@@ -25,6 +25,7 @@ import cv2
 
 from PyQt5.QtGui import (
     QFont,
+    QFontMetricsF,
     QImage,
     QPainter,
     QColor,
@@ -32,7 +33,7 @@ from PyQt5.QtGui import (
     QBrush,
     QPainterPath,
 )
-from PyQt5.QtCore import Qt, QRectF, QSize
+from PyQt5.QtCore import Qt, QSize
 
 from ..constants import (
     DEFAULT_FONT_FAMILY,
@@ -64,14 +65,32 @@ def _qt_color(rgba: Tuple[int, int, int, int]) -> QColor:
     return QColor(r, g, b, a)
 
 
-def _measure_text_rect(font: QFont, text: str) -> QRectF:
-    tmp = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
-    tmp.fill(Qt.transparent)
-    painter = QPainter(tmp)
-    painter.setFont(font)
-    rect = painter.boundingRect(QRectF(0, 0, 10000, 10000), Qt.TextSingleLine, text)
-    painter.end()
-    return rect
+def _tight_text_metrics(font: QFont, text: str, padding: int) -> tuple[int, int, float, float]:
+    """Calcule taille + origine de dessin à partir du rect "serré"."""
+    metrics = QFontMetricsF(font)
+    # tightBoundingRect inclut les dépassements négatifs éventuels (gauche/haut)
+    tight = metrics.tightBoundingRect(text)
+    width = tight.width()
+    height = tight.height()
+    left = tight.left()
+    top = tight.top()
+
+    advance = metrics.horizontalAdvance(text)
+    if advance > width:
+        width = advance
+        left = min(left, 0.0)
+
+    if height <= 0:
+        ascent = metrics.ascent()
+        descent = metrics.descent()
+        height = ascent + descent
+        top = -ascent
+
+    width = max(1, int(math.ceil(width)) + padding * 2)
+    height = max(1, int(math.ceil(height)) + padding * 2)
+    origin_x = padding - left
+    origin_y = padding - top
+    return width, height, origin_x, origin_y
 
 
 def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
@@ -87,31 +106,23 @@ def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
     base_font.setPointSize(style.font_point_size)
     base_font.setStyleStrategy(QFont.PreferAntialias)
 
-    rect_base = _measure_text_rect(base_font, text)
     pad_base = style.text_padding_px
-    w_base = int(math.ceil(rect_base.width())) + pad_base * 2
-    h_base = int(math.ceil(rect_base.height())) + pad_base * 2
-    w_base = max(w_base, 1)
-    h_base = max(h_base, 1)
+    w_base, h_base, base_x, base_y = _tight_text_metrics(base_font, text, pad_base)
 
     quality = max(1.0, float(getattr(style, "quality_scale", 1.0)))
 
     if math.isclose(quality, 1.0, rel_tol=1e-6):
         font = base_font
-        rect = rect_base
-        pad = pad_base
         w = w_base
         h = h_base
+        origin_x = base_x
+        origin_y = base_y
     else:
         font = QFont(style.font_family)
         font.setPointSizeF(style.font_point_size * quality)
         font.setStyleStrategy(QFont.PreferAntialias)
-        rect = _measure_text_rect(font, text)
         pad = int(math.ceil(pad_base * quality))
-        w = int(math.ceil(rect.width())) + pad * 2
-        h = int(math.ceil(rect.height())) + pad * 2
-        w = max(w, 1)
-        h = max(h, 1)
+        w, h, origin_x, origin_y = _tight_text_metrics(font, text, pad)
 
     img = QImage(QSize(w, h), QImage.Format_ARGB32_Premultiplied)
     img.fill(Qt.transparent)
@@ -132,14 +143,22 @@ def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
         painter.fillRect(0, 0, w, h, QBrush(bg))
 
     # Texte avec outline via QPainterPath pour un meilleur rendu
-    x = pad
-    y = pad + rect.height() - rect.bottom()  # baseline
-
     path = QPainterPath()
-    path.addText(x, y, font, text)
+    path.addText(origin_x, origin_y, font, text)
 
     if style.outline_thickness_px > 0:
-        painter.setPen(QPen(_qt_color(style.outline_color_rgba), style.outline_thickness_px, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        outline_width = style.outline_thickness_px
+        if not math.isclose(quality, 1.0, rel_tol=1e-6):
+            outline_width *= quality
+        painter.setPen(
+            QPen(
+                _qt_color(style.outline_color_rgba),
+                outline_width,
+                Qt.SolidLine,
+                Qt.RoundCap,
+                Qt.RoundJoin,
+            )
+        )
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(path)
 
