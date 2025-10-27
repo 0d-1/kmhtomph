@@ -25,7 +25,7 @@ from ..constants import (
 from ..ocr import OCRPipeline
 from ..video.io import VideoReader
 from ..video.exporter import export_video, ExportParams
-from ..video.overlay import OverlayStyle, render_text_pane_qt, paste_text_rotated
+from ..video.overlay import OverlayStyle, draw_speed_overlay, format_speed_text
 from .canvas import VideoCanvas
 from .settings import SettingsDialog
 
@@ -351,7 +351,7 @@ class MainWindow(QMainWindow):
         if kmh is not None:
             mph = kmh * KMH_TO_MPH
             self.lbl_kmh.setText(f"{kmh:.0f} km/h")
-            self.lbl_mph.setText(f"{mph:.0f} mph")
+            self.lbl_mph.setText(format_speed_text(mph))
         else:
             self.lbl_kmh.setText("-- km/h")
             self.lbl_mph.setText("-- mph")
@@ -398,6 +398,8 @@ class MainWindow(QMainWindow):
         base_corners = self.canvas.get_roi_corners().copy()
         style = self.overlay_style
 
+        last_mph_value = {"value": None}
+
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
             # Recalcule une fois (si on souhaite geler la position au début) : ici on garde base_corners
             roi_bgr = _extract_roi_from_corners(frame_bgr, base_corners, w, h)
@@ -405,11 +407,17 @@ class MainWindow(QMainWindow):
             if kmh is None:
                 return None
             mph = kmh * KMH_TO_MPH
-            return f"{mph:.0f} mph"
+            last_mph_value["value"] = mph
+            return format_speed_text(mph)
 
         def draw_overlay(frame_bgr: np.ndarray, text: str) -> None:
-            pane = render_text_pane_qt(text, style)
-            paste_text_rotated(frame_bgr, pane, (cx, cy), ang)
+            value = last_mph_value["value"]
+            if value is None:
+                try:
+                    value = float(text.split()[0])
+                except (ValueError, IndexError):
+                    return
+            draw_speed_overlay(frame_bgr, value, (cx, cy), ang, style, text=text)
 
         total = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
         progress = QProgressDialog("Export en cours…", "Annuler", 0, total or 0, self)
