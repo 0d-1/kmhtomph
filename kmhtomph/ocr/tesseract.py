@@ -158,6 +158,47 @@ def _looks_mostly_blank(thr: np.ndarray, *, min_fraction: float = 0.03) -> bool:
     return white_ratio < min_fraction or black_ratio < min_fraction
 
 
+def _content_bounds(thr: np.ndarray, *, min_area: int = 64) -> Optional[Tuple[int, int, int, int]]:
+    if thr.ndim != 2 or thr.size == 0:
+        return None
+
+    unique_vals, counts = np.unique(thr, return_counts=True)
+    if len(unique_vals) <= 1:
+        return None
+
+    bg_val = int(unique_vals[int(np.argmax(counts))])
+    if bg_val not in (0, 255):
+        # Fallback : considérer la valeur la plus proche de 0 ou 255 comme fond.
+        bg_val = 0 if abs(bg_val - 0) <= abs(bg_val - 255) else 255
+
+    mask = thr != bg_val
+    if not np.any(mask):
+        return None
+
+    coords = np.column_stack(np.where(mask))
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+
+    if (y1 - y0) * (x1 - x0) < int(min_area):
+        return None
+
+    margin_y = max(1, (y1 - y0) // 12)
+    margin_x = max(1, (x1 - x0) // 12)
+
+    y0 = max(0, y0 - margin_y)
+    y1 = min(thr.shape[0], y1 + margin_y)
+    x0 = max(0, x0 - margin_x)
+    x1 = min(thr.shape[1], x1 + margin_x)
+
+    return y0, y1, x0, x1
+
+
+def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.ndarray:
+    y0, y1, x0, x1 = bounds
+    cropped = img[y0:y1, x0:x1]
+    return cropped if cropped.size else img
+
+
 def _run_tesseract(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
     data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
 
@@ -198,10 +239,17 @@ def _tess_config(p: TesseractParams) -> str:
 def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
     gray_proc, thr_main = _prep_for_ocr(gray_in, p)
 
+    bounds = _content_bounds(thr_main)
+    if bounds:
+        gray_proc = _crop_to_bounds(gray_proc, bounds)
+        thr_main = _crop_to_bounds(thr_main, bounds)
+
     variants: List[np.ndarray] = [thr_main]
 
     if _looks_mostly_blank(thr_main):
         thr_adapt = _adaptive_binarize(gray_proc, p)
+        if bounds and thr_adapt.shape != thr_main.shape:
+            thr_adapt = _crop_to_bounds(thr_adapt, bounds)
         variants.append(thr_adapt)
         variants.append(cv2.bitwise_not(thr_adapt))
 
