@@ -10,12 +10,14 @@ from typing import Optional
 import numpy as np
 import cv2
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QAction, QFileDialog, QMessageBox, QApplication,
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox,
     QProgressDialog, QSlider
 )
+
+from pytesseract import TesseractNotFoundError
 
 from ..constants import (
     KMH_TO_MPH,
@@ -23,6 +25,7 @@ from ..constants import (
     DEFAULT_DEBUG_THUMB_SIZE,
 )
 from ..ocr import OCRPipeline
+from ..ocr.tesseract import auto_locate_tesseract
 from ..video.io import VideoReader
 from ..video.exporter import export_video, ExportParams
 from ..video.overlay import OverlayStyle, draw_speed_overlay, format_speed_text
@@ -74,7 +77,14 @@ class MainWindow(QMainWindow):
         self.show_debug_thumb = DEFAULT_SHOW_DEBUG_THUMB
         self.debug_thumb_size = DEFAULT_DEBUG_THUMB_SIZE
 
+        self._settings = QSettings("kmhtomph", "kmh_to_mph")
+        self._tesseract_error_shown = False
+
         self._tesseract_path: Optional[str] = None
+        stored_path = self._settings.value("tesseract/path", type=str)
+        if stored_path:
+            self._tesseract_path = stored_path
+        self._apply_tesseract_path(initial=True)
 
         # --- UI ---
         self.canvas = VideoCanvas(self)
@@ -337,7 +347,11 @@ class MainWindow(QMainWindow):
         corners = self.canvas.get_roi_corners()  # (4,2) TL,TR,BR,BL en coords image
         roi = _extract_roi_from_corners(frame, corners, w, h)
 
-        kmh, debug_bgr, score, details = self.ocr.read_kmh(roi, mode=self.ocr_mode)
+        try:
+            kmh, debug_bgr, score, details = self.ocr.read_kmh(roi, mode=self.ocr_mode)
+        except (TesseractNotFoundError, FileNotFoundError) as e:
+            self._handle_tesseract_error(e)
+            return
 
         if self.show_debug_thumb:
             if debug_bgr is not None and debug_bgr.size > 0:
@@ -373,7 +387,60 @@ class MainWindow(QMainWindow):
     def _on_settings(self):
         dlg = SettingsDialog(self, initial_path=self._tesseract_path)
         if dlg.exec_():
+            prev_path = self._tesseract_path
             self._tesseract_path = dlg.tesseract_path or None
+            if not self._apply_tesseract_path():
+                self._tesseract_path = prev_path
+                self._apply_tesseract_path(initial=True)
+
+    def _apply_tesseract_path(self, *, initial: bool = False) -> bool:
+        path = self._tesseract_path or None
+        try:
+            auto_locate_tesseract(path)
+        except FileNotFoundError as e:
+            if not initial:
+                QMessageBox.warning(
+                    self,
+                    "Tesseract introuvable",
+                    "Impossible de trouver l'exécutable Tesseract.\n"
+                    "Vérifiez l'installation ou choisissez le bon fichier dans les Paramètres OCR.\n"
+                    f"Détail : {e}",
+                )
+            return False
+        else:
+            self._tesseract_error_shown = False
+            if path:
+                self._save_tesseract_path()
+            elif not initial:
+                self._settings.remove("tesseract/path")
+                self._settings.sync()
+            return True
+
+    def _save_tesseract_path(self) -> None:
+        if self._tesseract_path:
+            self._settings.setValue("tesseract/path", self._tesseract_path)
+        else:
+            self._settings.remove("tesseract/path")
+        self._settings.sync()
+
+    def _handle_tesseract_error(self, err: Exception) -> None:
+        if self._tesseract_error_shown:
+            return
+        self._tesseract_error_shown = True
+        if self.playing:
+            self.playing = False
+            self.timer.stop()
+            self.btn_play.setText("Lecture")
+        self.canvas.clear_debug_thumb()
+        self.lbl_kmh.setText("-- km/h")
+        self.lbl_mph.setText("-- mph")
+        QMessageBox.critical(
+            self,
+            "Erreur Tesseract",
+            "Tesseract n'a pas pu être exécuté.\n"
+            "Veuillez vérifier l'installation et configurer le chemin dans Paramètres OCR…\n"
+            f"Détail : {err}",
+        )
 
     # ------------- Export -------------
 
@@ -403,7 +470,11 @@ class MainWindow(QMainWindow):
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
             # Recalcule une fois (si on souhaite geler la position au début) : ici on garde base_corners
             roi_bgr = _extract_roi_from_corners(frame_bgr, base_corners, w, h)
-            kmh, debug_bgr, score, details = self.ocr.read_kmh(roi_bgr, mode=self.ocr_mode)
+            try:
+                kmh, debug_bgr, score, details = self.ocr.read_kmh(roi_bgr, mode=self.ocr_mode)
+            except (TesseractNotFoundError, FileNotFoundError) as e:
+                self._handle_tesseract_error(e)
+                raise RuntimeError("Tesseract introuvable") from e
             if kmh is None:
                 return None
             mph = kmh * KMH_TO_MPH
