@@ -48,6 +48,16 @@ def reset(state: AntiJitterState) -> None:
     state.win = _MedianWindow(state.config.window_size)
 
 
+def update_config(state: AntiJitterState, config: AntiJitterConfig) -> None:
+    """Met à jour la configuration de lissage tout en conservant l'état utile."""
+    state.config = config
+    last_value = state.last_kmh
+    state.win = _MedianWindow(config.window_size)
+    if last_value is not None:
+        state.win.add(float(last_value))
+    state.miss_streak = min(state.miss_streak, int(config.hold_max_gap_frames))
+
+
 def _score_candidate(value: float, conf: float, median_ref: Optional[float]) -> float:
     base = float(conf)
     if median_ref is None:
