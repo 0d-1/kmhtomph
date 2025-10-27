@@ -110,7 +110,15 @@ def _binarize(gray: np.ndarray) -> np.ndarray:
     return thr
 
 
-def _prep_for_ocr(gray_in: np.ndarray, p: TesseractParams) -> np.ndarray:
+def _apply_morphology(thr: np.ndarray, p: TesseractParams) -> np.ndarray:
+    if p.morph_open:
+        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    if p.morph_close:
+        thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
+    return thr
+
+
+def _prep_for_ocr(gray_in: np.ndarray, p: TesseractParams) -> Tuple[np.ndarray, np.ndarray]:
     g = _make_gray(gray_in)
     # upscale
     h = max(int(p.scale_to_height), 24)
@@ -126,22 +134,31 @@ def _prep_for_ocr(gray_in: np.ndarray, p: TesseractParams) -> np.ndarray:
     if p.unsharp:
         g = _unsharp_mask(g)
 
-    thr = _binarize(g)
-    if p.morph_open:
-        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
-    if p.morph_close:
-        thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
-    return thr
+    thr = _apply_morphology(_binarize(g), p)
+    return g, thr
 
 
-def _tess_config(p: TesseractParams) -> str:
-    wl = p.whitelist + (".," if p.allow_dot else "")
-    config = f"--psm {int(p.psm)} --oem {int(p.oem)} -c tessedit_char_whitelist={wl}"
-    return config
+def _adaptive_binarize(gray: np.ndarray, p: TesseractParams) -> np.ndarray:
+    thr = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        15,
+        2,
+    )
+    return _apply_morphology(thr, p)
 
 
-def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    thr = _prep_for_ocr(gray_in, p)
+def _looks_mostly_blank(thr: np.ndarray, *, min_fraction: float = 0.03) -> bool:
+    if thr.size == 0:
+        return True
+    white_ratio = float(np.count_nonzero(thr == 255)) / float(thr.size)
+    black_ratio = 1.0 - white_ratio
+    return white_ratio < min_fraction or black_ratio < min_fraction
+
+
+def _run_tesseract(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
     data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
 
     # Extraire texte brut + confiance
@@ -170,6 +187,31 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
 
     dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
     return (txt if txt else None), conf, dbg
+
+
+def _tess_config(p: TesseractParams) -> str:
+    wl = p.whitelist + (".," if p.allow_dot else "")
+    config = f"--psm {int(p.psm)} --oem {int(p.oem)} -c tessedit_char_whitelist={wl}"
+    return config
+
+
+def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
+    gray_proc, thr_main = _prep_for_ocr(gray_in, p)
+
+    variants: List[np.ndarray] = [thr_main]
+
+    if _looks_mostly_blank(thr_main):
+        thr_adapt = _adaptive_binarize(gray_proc, p)
+        variants.append(thr_adapt)
+        variants.append(cv2.bitwise_not(thr_adapt))
+
+    best: Tuple[Optional[str], float, np.ndarray] = (None, 0.0, cv2.cvtColor(thr_main, cv2.COLOR_GRAY2BGR))
+    for thr in variants:
+        txt, conf, dbg = _run_tesseract(thr, p)
+        if conf >= best[1]:
+            best = (txt, conf, dbg)
+
+    return best
 
 
 def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = None) -> Tuple[Optional[str], float, np.ndarray]:
