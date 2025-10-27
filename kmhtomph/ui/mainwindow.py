@@ -15,8 +15,9 @@ from PyQt5.QtCore import Qt, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QAction, QFileDialog, QMessageBox, QApplication,
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox,
-    QProgressDialog, QSlider
+    QProgressDialog, QSlider, QGroupBox, QFormLayout, QDoubleSpinBox, QSizePolicy
 )
+from PyQt5.QtGui import QImage, QPixmap
 
 from pytesseract import TesseractNotFoundError
 
@@ -24,6 +25,7 @@ from ..constants import (
     KMH_TO_MPH,
     DEFAULT_SHOW_DEBUG_THUMB,
     DEFAULT_DEBUG_THUMB_SIZE,
+    AntiJitterConfig,
 )
 from ..ocr import OCRPipeline
 from ..ocr.tesseract import auto_locate_tesseract
@@ -80,6 +82,8 @@ class MainWindow(QMainWindow):
         self._loading_overlay_settings = False
         self.show_debug_thumb = DEFAULT_SHOW_DEBUG_THUMB
         self.debug_thumb_size = DEFAULT_DEBUG_THUMB_SIZE
+        self._last_debug_bgr: Optional[np.ndarray] = None
+        self._loading_smoothing_settings = False
 
         self._settings = QSettings("kmhtomph", "kmh_to_mph")
         self._tesseract_error_shown = False
@@ -160,10 +164,20 @@ class MainWindow(QMainWindow):
         prog_bar.addSpacing(8)
         prog_bar.addWidget(self.lbl_time)
 
+        self.side_panel = self._create_side_panel()
+        self._update_debug_preview_geometry()
+        self._load_smoothing_settings()
+        self._refresh_debug_thumbnail()
+
         central = QWidget(self)
         lay = QVBoxLayout(central)
         lay.addLayout(top_bar)
-        lay.addWidget(self.canvas, 1)
+
+        content = QHBoxLayout()
+        content.addWidget(self.canvas, 1)
+        content.addWidget(self.side_panel)
+        lay.addLayout(content, 1)
+
         lay.addLayout(prog_bar)
         self.setCentralWidget(central)
 
@@ -189,6 +203,179 @@ class MainWindow(QMainWindow):
         self.resize(1000, 740)
 
     # ------------- Menu -------------
+
+    def _create_side_panel(self) -> QWidget:
+        panel = QWidget(self)
+        panel.setMinimumWidth(260)
+        panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(12)
+
+        smoothing_group = QGroupBox("Lissage", panel)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        smoothing_group.setLayout(form)
+
+        self.spin_smooth_window = QSpinBox(smoothing_group)
+        self.spin_smooth_window.setRange(1, 31)
+        self.spin_smooth_window.setValue(int(self.ocr.anti_jitter.window_size))
+        self.spin_smooth_window.setToolTip("Nombre d'images utilisées pour la médiane.")
+        form.addRow("Fenêtre médiane", self.spin_smooth_window)
+
+        self.spin_smooth_delta = QDoubleSpinBox(smoothing_group)
+        self.spin_smooth_delta.setDecimals(1)
+        self.spin_smooth_delta.setSingleStep(0.1)
+        self.spin_smooth_delta.setRange(0.5, 25.0)
+        self.spin_smooth_delta.setValue(float(self.ocr.anti_jitter.max_delta_kmh))
+        self.spin_smooth_delta.setSuffix(" km/h")
+        self.spin_smooth_delta.setToolTip("Variation maximale autorisée entre deux mesures successives.")
+        form.addRow("Delta max.", self.spin_smooth_delta)
+
+        self.spin_smooth_conf = QDoubleSpinBox(smoothing_group)
+        self.spin_smooth_conf.setDecimals(2)
+        self.spin_smooth_conf.setSingleStep(0.05)
+        self.spin_smooth_conf.setRange(0.0, 1.0)
+        self.spin_smooth_conf.setValue(float(self.ocr.anti_jitter.min_confidence))
+        self.spin_smooth_conf.setToolTip("Score minimal requis pour accepter une valeur.")
+        form.addRow("Confiance min.", self.spin_smooth_conf)
+
+        self.spin_smooth_hold = QSpinBox(smoothing_group)
+        self.spin_smooth_hold.setRange(0, 120)
+        self.spin_smooth_hold.setValue(int(self.ocr.anti_jitter.hold_max_gap_frames))
+        self.spin_smooth_hold.setToolTip("Nombre de frames durant lesquelles conserver la dernière valeur fiable.")
+        form.addRow("Maintien (frames)", self.spin_smooth_hold)
+
+        self.spin_smooth_window.valueChanged.connect(self._on_smoothing_params_changed)
+        self.spin_smooth_delta.valueChanged.connect(self._on_smoothing_params_changed)
+        self.spin_smooth_conf.valueChanged.connect(self._on_smoothing_params_changed)
+        self.spin_smooth_hold.valueChanged.connect(self._on_smoothing_params_changed)
+
+        layout.addWidget(smoothing_group)
+
+        layout.addStretch(1)
+
+        self.debug_label_title = QLabel("Vignette debug", panel)
+        self.debug_label_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.debug_label_title)
+
+        self.debug_preview = QLabel(panel)
+        self.debug_preview.setAlignment(Qt.AlignCenter)
+        self.debug_preview.setStyleSheet("background-color: #111; border: 1px solid #333; color: #888;")
+        self.debug_preview.setWordWrap(True)
+        self.debug_preview.setText("Aucune vignette")
+        layout.addWidget(self.debug_preview, 0, Qt.AlignBottom)
+
+        return panel
+
+    def _collect_smoothing_config(self) -> AntiJitterConfig:
+        return AntiJitterConfig(
+            window_size=int(self.spin_smooth_window.value()),
+            max_delta_kmh=float(self.spin_smooth_delta.value()),
+            min_confidence=float(self.spin_smooth_conf.value()),
+            hold_max_gap_frames=int(self.spin_smooth_hold.value()),
+        )
+
+    def _load_smoothing_settings(self) -> None:
+        if not hasattr(self, "spin_smooth_window"):
+            return
+
+        self._loading_smoothing_settings = True
+        try:
+            cfg = self.ocr.anti_jitter
+            window = self._settings.value("smoothing/window_size", cfg.window_size, type=int)
+            delta = self._settings.value("smoothing/max_delta", cfg.max_delta_kmh, type=float)
+            conf = self._settings.value("smoothing/min_confidence", cfg.min_confidence, type=float)
+            hold = self._settings.value("smoothing/hold_frames", cfg.hold_max_gap_frames, type=int)
+
+            if window is None:
+                window = cfg.window_size
+            if delta is None:
+                delta = cfg.max_delta_kmh
+            if conf is None:
+                conf = cfg.min_confidence
+            if hold is None:
+                hold = cfg.hold_max_gap_frames
+
+            self.spin_smooth_window.blockSignals(True)
+            self.spin_smooth_window.setValue(int(window))
+            self.spin_smooth_window.blockSignals(False)
+
+            self.spin_smooth_delta.blockSignals(True)
+            self.spin_smooth_delta.setValue(float(delta))
+            self.spin_smooth_delta.blockSignals(False)
+
+            self.spin_smooth_conf.blockSignals(True)
+            self.spin_smooth_conf.setValue(float(conf))
+            self.spin_smooth_conf.blockSignals(False)
+
+            self.spin_smooth_hold.blockSignals(True)
+            self.spin_smooth_hold.setValue(int(hold))
+            self.spin_smooth_hold.blockSignals(False)
+        finally:
+            self._loading_smoothing_settings = False
+
+        config = self._collect_smoothing_config()
+        self.ocr.set_anti_jitter_config(config)
+
+    def _save_smoothing_settings(self, config: AntiJitterConfig) -> None:
+        self._settings.setValue("smoothing/window_size", int(config.window_size))
+        self._settings.setValue("smoothing/max_delta", float(config.max_delta_kmh))
+        self._settings.setValue("smoothing/min_confidence", float(config.min_confidence))
+        self._settings.setValue("smoothing/hold_frames", int(config.hold_max_gap_frames))
+        self._settings.sync()
+
+    def _on_smoothing_params_changed(self):
+        if self._loading_smoothing_settings:
+            return
+        config = self._collect_smoothing_config()
+        self.ocr.set_anti_jitter_config(config)
+        self._save_smoothing_settings(config)
+
+    def _update_debug_preview_geometry(self) -> None:
+        if not hasattr(self, "debug_preview"):
+            return
+        size = max(64, int(self.debug_thumb_size))
+        self.debug_preview.setFixedSize(size, size)
+
+    def _bgr_to_pixmap(self, debug_bgr: np.ndarray) -> Optional[QPixmap]:
+        if debug_bgr.ndim == 2:
+            rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_GRAY2RGB)
+            fmt = QImage.Format_RGB888
+        elif debug_bgr.ndim == 3 and debug_bgr.shape[2] == 3:
+            rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGR2RGB)
+            fmt = QImage.Format_RGB888
+        elif debug_bgr.ndim == 3 and debug_bgr.shape[2] == 4:
+            rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGRA2RGBA)
+            fmt = QImage.Format_RGBA8888
+        else:
+            return None
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], fmt)
+        return QPixmap.fromImage(qimg.copy())
+
+    def _set_debug_thumbnail(self, debug_bgr: Optional[np.ndarray]) -> None:
+        self._last_debug_bgr = None if debug_bgr is None else debug_bgr.copy()
+        self._refresh_debug_thumbnail()
+
+    def _refresh_debug_thumbnail(self) -> None:
+        if not hasattr(self, "debug_preview"):
+            return
+        if not self.show_debug_thumb:
+            self.debug_preview.setPixmap(QPixmap())
+            self.debug_preview.setText("Vignette désactivée")
+            return
+        if self._last_debug_bgr is None or self._last_debug_bgr.size == 0:
+            self.debug_preview.setPixmap(QPixmap())
+            self.debug_preview.setText("Aucune vignette")
+            return
+        pixmap = self._bgr_to_pixmap(self._last_debug_bgr)
+        if pixmap is None or pixmap.isNull():
+            self.debug_preview.setPixmap(QPixmap())
+            self.debug_preview.setText("Aucune vignette")
+            return
+        scaled = pixmap.scaled(self.debug_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.debug_preview.setPixmap(scaled)
+        self.debug_preview.setText("")
 
     def _create_menu(self):
         menubar = self.menuBar()
@@ -418,9 +605,12 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_debug(self, state: int):
         self.show_debug_thumb = (state == Qt.Checked)
+        self._refresh_debug_thumbnail()
 
     def _on_thumb_size(self, v: int):
         self.debug_thumb_size = int(v)
+        self._update_debug_preview_geometry()
+        self._refresh_debug_thumbnail()
 
     def _on_open(self):
         path, _ = QFileDialog.getOpenFileName(self, "Ouvrir une vidéo", "", "Vidéos (*.mp4 *.m4v *.mov *.avi *.mkv);;Tous les fichiers (*)")
@@ -458,6 +648,7 @@ class MainWindow(QMainWindow):
         self._last_overlay_text = None
         self._set_overlay_text(None, allow_placeholder=True)
         self.ocr.reset()
+        self._set_debug_thumbnail(None)
 
     def _on_toggle_play(self):
         if not self.reader or not self.reader.is_opened():
@@ -490,14 +681,10 @@ class MainWindow(QMainWindow):
             self._handle_tesseract_error(e)
             return
 
-        if self.show_debug_thumb:
-            if debug_bgr is not None and debug_bgr.size > 0:
-                thumb = cv2.resize(debug_bgr, (self.debug_thumb_size, self.debug_thumb_size), interpolation=cv2.INTER_NEAREST)
-                self.canvas.set_debug_thumb(thumb)
-            else:
-                self.canvas.clear_debug_thumb()
+        if debug_bgr is not None and debug_bgr.size > 0:
+            self._set_debug_thumbnail(debug_bgr)
         else:
-            self.canvas.clear_debug_thumb()
+            self._set_debug_thumbnail(None)
 
         if kmh is not None:
             mph = kmh * KMH_TO_MPH
@@ -571,7 +758,7 @@ class MainWindow(QMainWindow):
             self.playing = False
             self.timer.stop()
             self.btn_play.setText("Lecture")
-        self.canvas.clear_debug_thumb()
+        self._set_debug_thumbnail(None)
         self.lbl_kmh.setText("-- km/h")
         self.lbl_mph.setText("-- mph")
         QMessageBox.critical(

@@ -8,7 +8,7 @@ import numpy as np
 
 from .tesseract import tesseract_ocr, TesseractParams, DEFAULT_PARAMS as DEFAULT_TESS_PARAMS
 from .sevenseg import sevenseg_ocr
-from .chooser import AntiJitterState, choose_best_kmh, reset as reset_state
+from .chooser import AntiJitterState, choose_best_kmh, reset as reset_state, update_config as update_state_config
 from ..constants import DEFAULT_ANTI_JITTER, AntiJitterConfig
 
 
@@ -21,8 +21,15 @@ class OCRPipeline:
     auto_prefer_7seg_min_digits: int = 2
     auto_prefer_7seg_delta_factor: float = 1.2
 
+    def __post_init__(self):
+        update_state_config(self.state, self.anti_jitter)
+
     def reset(self):
         reset_state(self.state)
+
+    def set_anti_jitter_config(self, config: AntiJitterConfig) -> None:
+        self.anti_jitter = config
+        update_state_config(self.state, config)
 
     def read_kmh(self, roi_bgr: np.ndarray, mode: str = "auto"):
         """

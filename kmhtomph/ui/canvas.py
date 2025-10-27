@@ -27,8 +27,6 @@ class VideoCanvas(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._frame_bgr: Optional[np.ndarray] = None
-        self._debug_bgr: Optional[np.ndarray] = None
-
         # ROI : centre, taille, angle (deg)
         self._cx = 200
         self._cy = 150
@@ -69,14 +67,6 @@ class VideoCanvas(QtWidgets.QWidget):
     def set_frame(self, frame_bgr: np.ndarray) -> None:
         assert frame_bgr.ndim == 3 and frame_bgr.shape[2] == 3, "frame_bgr doit être BGR HxWx3"
         self._frame_bgr = frame_bgr.copy()
-        self.update()
-
-    def set_debug_thumb(self, debug_bgr: Optional[np.ndarray]) -> None:
-        self._debug_bgr = debug_bgr.copy() if debug_bgr is not None else None
-        self.update()
-
-    def clear_debug_thumb(self) -> None:
-        self._debug_bgr = None
         self.update()
 
     def set_roi(self, cx: int, cy: int, w: int, h: int, angle_deg: float = 0.0) -> None:
@@ -250,23 +240,6 @@ class VideoCanvas(QtWidgets.QWidget):
                 handles=True,
                 color=overlay_color,
                 draw_rect=False,
-            )
-
-        # Vignette debug
-        if self._debug_bgr is not None and self._debug_bgr.size > 0:
-            thumb = _bgr_to_qimage(self._debug_bgr)
-            tw = min(200, max(1, self.width() // 3))
-            th = int(thumb.height() * (tw / max(1, thumb.width())))
-            x = self.width() - tw - 10
-            y = self.height() - th - 10
-
-            p.setOpacity(0.95)
-            p.fillRect(x - 2, y - 2, tw + 4, th + 4, QtGui.QColor(0, 0, 0, 140))
-            p.setOpacity(1.0)
-
-            p.drawImage(
-                x, y,
-                thumb.scaled(tw, th, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation),
             )
 
         p.end()
