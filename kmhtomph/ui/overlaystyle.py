@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QColorDialog,
     QFontComboBox,
     QWidget,
+    QDoubleSpinBox,
 )
 
 from ..video.overlay import OverlayStyle, render_text_pane_qt
@@ -46,6 +47,12 @@ class OverlayStyleDialog(QDialog):
         self._font_size = QSpinBox(self)
         self._font_size.setRange(8, 128)
         self._font_size.setValue(self._initial_style.font_point_size)
+
+        self._quality_spin = QDoubleSpinBox(self)
+        self._quality_spin.setRange(1.0, 4.0)
+        self._quality_spin.setSingleStep(0.25)
+        self._quality_spin.setDecimals(2)
+        self._quality_spin.setValue(max(1.0, min(4.0, getattr(self._initial_style, "quality_scale", 1.0))))
 
         self._text_color = _qcolor_from_rgba(self._initial_style.text_color_rgba)
         self._bg_color = _qcolor_from_rgba(self._initial_style.bg_color_rgba)
@@ -78,6 +85,11 @@ class OverlayStyleDialog(QDialog):
         font_box.addWidget(QLabel("Taille :", self))
         font_box.addWidget(self._font_size)
 
+        quality_box = QHBoxLayout()
+        quality_box.addWidget(QLabel("Netteté :", self))
+        quality_box.addWidget(self._quality_spin)
+        quality_box.addStretch(1)
+
         opacity_box = QHBoxLayout()
         opacity_box.addWidget(QLabel("Opacité du fond :", self))
         opacity_box.addWidget(self._opacity_slider, 1)
@@ -95,6 +107,7 @@ class OverlayStyleDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lay.addLayout(font_box)
+        lay.addLayout(quality_box)
         lay.addLayout(btn_box)
         lay.addLayout(opacity_box)
         lay.addWidget(QLabel("Aperçu :", self))
@@ -103,6 +116,7 @@ class OverlayStyleDialog(QDialog):
 
         self._font_combo.currentFontChanged.connect(self._update_preview)
         self._font_size.valueChanged.connect(self._update_preview)
+        self._quality_spin.valueChanged.connect(self._update_preview)
         self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
 
         self._update_buttons()
@@ -120,6 +134,7 @@ class OverlayStyleDialog(QDialog):
             text_color_rgba=_rgba_from_qcolor(self._text_color),
             bg_color_rgba=_rgba_from_qcolor(self._bg_color),
             fill_opacity=max(0.0, min(1.0, self._opacity_slider.value() / 100.0)),
+            quality_scale=float(self._quality_spin.value()),
         )
 
     def _on_opacity_changed(self, value: int) -> None:

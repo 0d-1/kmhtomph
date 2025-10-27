@@ -24,7 +24,13 @@ import numpy as np
 import cv2
 
 from PyQt5.QtGui import (
-    QFont, QImage, QPainter, QColor, QPen, QBrush, QPainterPath,
+    QFont,
+    QImage,
+    QPainter,
+    QColor,
+    QPen,
+    QBrush,
+    QPainterPath,
 )
 from PyQt5.QtCore import Qt, QRectF, QSize
 
@@ -50,11 +56,22 @@ class OverlayStyle:
     bg_color_rgba: Tuple[int, int, int, int] = DEFAULT_BG_COLOR_RGBA
     text_padding_px: int = DEFAULT_TEXT_PADDING_PX
     fill_opacity: float = DEFAULT_FILL_OPACITY  # 0..1
+    quality_scale: float = 1.0  # ≥1.0 : suréchantillonnage pour la netteté
 
 
 def _qt_color(rgba: Tuple[int, int, int, int]) -> QColor:
     r, g, b, a = rgba
     return QColor(r, g, b, a)
+
+
+def _measure_text_rect(font: QFont, text: str) -> QRectF:
+    tmp = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+    tmp.fill(Qt.transparent)
+    painter = QPainter(tmp)
+    painter.setFont(font)
+    rect = painter.boundingRect(QRectF(0, 0, 10000, 10000), Qt.TextSingleLine, text)
+    painter.end()
+    return rect
 
 
 def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
@@ -65,25 +82,36 @@ def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
     if not text:
         text = " "  # éviter largeur/hauteur nulles
 
-    # Préparer police
-    font = QFont(style.font_family)
-    font.setPointSize(style.font_point_size)
-    font.setStyleStrategy(QFont.PreferAntialias)
+    # Préparer police & suréchantillonnage
+    base_font = QFont(style.font_family)
+    base_font.setPointSize(style.font_point_size)
+    base_font.setStyleStrategy(QFont.PreferAntialias)
 
-    # Mesure
-    tmp = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
-    tmp.fill(Qt.transparent)
-    p = QPainter(tmp)
-    p.setRenderHint(QPainter.TextAntialiasing, True)
-    p.setFont(font)
-    rect = p.boundingRect(QRectF(0, 0, 10000, 10000), Qt.TextSingleLine, text)
-    p.end()
+    rect_base = _measure_text_rect(base_font, text)
+    pad_base = style.text_padding_px
+    w_base = int(math.ceil(rect_base.width())) + pad_base * 2
+    h_base = int(math.ceil(rect_base.height())) + pad_base * 2
+    w_base = max(w_base, 1)
+    h_base = max(h_base, 1)
 
-    pad = style.text_padding_px
-    w = int(rect.width()) + pad * 2
-    h = int(rect.height()) + pad * 2
-    w = max(w, 1)
-    h = max(h, 1)
+    quality = max(1.0, float(getattr(style, "quality_scale", 1.0)))
+
+    if math.isclose(quality, 1.0, rel_tol=1e-6):
+        font = base_font
+        rect = rect_base
+        pad = pad_base
+        w = w_base
+        h = h_base
+    else:
+        font = QFont(style.font_family)
+        font.setPointSizeF(style.font_point_size * quality)
+        font.setStyleStrategy(QFont.PreferAntialias)
+        rect = _measure_text_rect(font, text)
+        pad = int(math.ceil(pad_base * quality))
+        w = int(math.ceil(rect.width())) + pad * 2
+        h = int(math.ceil(rect.height())) + pad * 2
+        w = max(w, 1)
+        h = max(h, 1)
 
     img = QImage(QSize(w, h), QImage.Format_ARGB32_Premultiplied)
     img.fill(Qt.transparent)
@@ -120,6 +148,15 @@ def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
     painter.drawPath(path)
 
     painter.end()
+
+    if not math.isclose(quality, 1.0, rel_tol=1e-6):
+        img = img.scaled(
+            w_base,
+            h_base,
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
     return img
 
 
@@ -195,6 +232,7 @@ def paste_text_rotated(
         th = int(round(th))
         if tw > 0 and th > 0 and w > 0 and h > 0:
             scale = min(tw / float(w), th / float(h))
+            scale = min(scale, 1.0)
             if scale > 0 and not math.isclose(scale, 1.0, rel_tol=1e-3, abs_tol=1e-3):
                 new_w = max(1, int(round(w * scale)))
                 new_h = max(1, int(round(h * scale)))
