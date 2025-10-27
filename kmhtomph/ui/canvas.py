@@ -222,6 +222,7 @@ class VideoCanvas(QtWidgets.QWidget):
             img_w = float(self._overlay_qimage.width())
             img_h = float(self._overlay_qimage.height())
             scale = min(target_w / img_w, target_h / img_h) if img_w > 0 and img_h > 0 else 1.0
+            scale = min(scale, 1.0)
             scale = max(scale, 1e-3)
             draw_w = img_w * scale
             draw_h = img_h * scale

@@ -484,6 +484,15 @@ class MainWindow(QMainWindow):
             else:
                 fill = max(0.0, min(1.0, fill))
             style = replace(style, fill_opacity=fill)
+        quality_value = self._settings.value("overlay/quality_scale")
+        if quality_value is not None:
+            try:
+                quality = float(quality_value)
+            except (TypeError, ValueError):
+                quality = style.quality_scale
+            else:
+                quality = max(1.0, min(4.0, quality))
+            style = replace(style, quality_scale=quality)
         return style
 
     def _save_overlay_style(self) -> None:
@@ -492,6 +501,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("overlay/text_color", self._rgba_to_string(self.overlay_style.text_color_rgba))
         self._settings.setValue("overlay/bg_color", self._rgba_to_string(self.overlay_style.bg_color_rgba))
         self._settings.setValue("overlay/fill_opacity", float(self.overlay_style.fill_opacity))
+        self._settings.setValue("overlay/quality_scale", float(getattr(self.overlay_style, "quality_scale", 1.0)))
         self._settings.sync()
 
     def _load_overlay_rect(self) -> None:
