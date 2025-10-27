@@ -9,12 +9,14 @@ Expose :
 - OverlayStyle : paramètres de style
 - render_text_pane_qt(text, style) -> QImage (premultiplied ARGB32)
 - paste_text_rotated(frame_bgr, qimage, center, angle_deg) -> None (in-place)
+- format_speed_text(value, unit="mph", decimals=0) -> str
+- draw_speed_overlay(frame_bgr, value, center, angle_deg, style, unit="mph", decimals=0) -> str
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import cv2
@@ -197,3 +199,44 @@ def paste_text_rotated(
     # Positionner le coin supérieur gauche pour que le centre coïncide
     top_left = (int(center[0] - rotated.shape[1] // 2), int(center[1] - rotated.shape[0] // 2))
     _alpha_blend_bgra(frame_bgr, rotated, top_left)
+
+
+def format_speed_text(value: float, unit: str = "mph", decimals: int = 0) -> str:
+    """Retourne la chaîne formatée pour une vitesse (ex: "54 mph")."""
+    unit = unit.strip() or "mph"
+    decimals = max(0, int(decimals))
+    if decimals <= 0:
+        return f"{int(round(value))} {unit}"
+    formatted = f"{value:.{decimals}f}"
+    return f"{formatted} {unit}"
+
+
+def draw_speed_overlay(
+    frame_bgr: np.ndarray,
+    value: float,
+    center: Tuple[int, int],
+    angle_deg: float,
+    style: OverlayStyle,
+    unit: str = "mph",
+    decimals: int = 0,
+    text: Optional[str] = None,
+) -> str:
+    """
+    Dessine la vitesse formatée sur la frame et retourne le texte affiché.
+
+    Cette fonction encapsule ``render_text_pane_qt`` et ``paste_text_rotated`` pour
+    garantir que l’export et l’aperçu emploient exactement le même rendu
+    typographique que l’application Qt.
+
+    Paramètres supplémentaires :
+    - unit : suffixe unité (par défaut "mph").
+    - decimals : nombre de décimales lorsque ``text`` n’est pas fourni.
+    - text : chaîne déjà formatée à dessiner (permet de garantir 1:1 avec
+      l’affichage en UI ou d’utiliser une autre langue/unité).
+    """
+
+    if text is None:
+        text = format_speed_text(value, unit=unit, decimals=decimals)
+    pane = render_text_pane_qt(text, style)
+    paste_text_rotated(frame_bgr, pane, center, angle_deg)
+    return text
