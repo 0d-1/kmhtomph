@@ -6,6 +6,7 @@ Séparées du reste pour éviter les imports circulaires et centraliser le tunin
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 # Conversion
 KMH_TO_MPH: float = 0.621371192237334  # 1 km/h = 0.62137 mph
@@ -16,6 +17,11 @@ DEFAULT_FONT_POINT_SIZE: int = 28
 DEFAULT_TEXT_PADDING_PX: int = 6
 DEFAULT_OUTLINE_THICKNESS_PX: int = 2
 DEFAULT_FILL_OPACITY: float = 0.75  # 0..1 pour l'arrière-plan
+
+# Couleurs RGBA (0..255) pour l'overlay texte
+DEFAULT_TEXT_COLOR_RGBA: Tuple[int, int, int, int] = (255, 255, 255, 255)
+DEFAULT_OUTLINE_COLOR_RGBA: Tuple[int, int, int, int] = (0, 0, 0, 255)
+DEFAULT_BG_COLOR_RGBA: Tuple[int, int, int, int] = (0, 0, 0, 180)
 
 # Anti-jitter / sélection de la meilleure valeur OCR
 @dataclass(frozen=True)

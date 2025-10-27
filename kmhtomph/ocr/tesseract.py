@@ -4,6 +4,9 @@ from dataclasses import dataclass, replace
 from typing import Optional, Tuple, List
 
 import re
+import os
+import shutil
+import sys
 import cv2
 import numpy as np
 import pytesseract
@@ -32,6 +35,56 @@ class TesseractParams:
 
 
 DEFAULT_PARAMS = TesseractParams()
+
+
+def _is_executable_file(path: str) -> bool:
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def auto_locate_tesseract(explicit_path: Optional[str] = None) -> str:
+    """Configure pytesseract pour utiliser un binaire valide.
+
+    Si ``explicit_path`` est fourni, il est testé en priorité. Sinon, on tente :
+    - la valeur déjà configurée dans ``pytesseract.pytesseract.tesseract_cmd`` ;
+    - ``shutil.which('tesseract')`` ;
+    - quelques emplacements connus sous Windows.
+
+    Retourne le chemin retenu ou lève ``FileNotFoundError`` si aucun binaire n’est
+    disponible.
+    """
+
+    candidates: List[str] = []
+
+    if explicit_path:
+        candidates.append(explicit_path)
+
+    current_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "")
+    if current_cmd:
+        candidates.append(current_cmd)
+
+    found_on_path = shutil.which("tesseract")
+    if found_on_path:
+        candidates.append(found_on_path)
+
+    if sys.platform.startswith("win"):
+        program_files = os.environ.get("PROGRAMFILES", r"C:\\Program Files")
+        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\\Program Files (x86)")
+        win_defaults = [
+            os.path.join(program_files, "Tesseract-OCR", "tesseract.exe"),
+            os.path.join(program_files_x86, "Tesseract-OCR", "tesseract.exe"),
+        ]
+        candidates.extend(win_defaults)
+
+    checked = set()
+    for path in candidates:
+        if not path or path in checked:
+            continue
+        checked.add(path)
+        if _is_executable_file(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            return path
+
+    raise FileNotFoundError("Aucun exécutable Tesseract valide trouvé")
 
 
 def _make_gray(img: np.ndarray) -> np.ndarray:
