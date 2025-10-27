@@ -87,12 +87,12 @@ def _split_digits_by_projection(bin_img: np.ndarray) -> List[Tuple[int, int, int
     return boxes
 
 
-def _classify_7seg_digit(patch_bin: np.ndarray) -> Optional[int]:
-    """Classification simple d’un digit 7-segments à partir de 7 régions."""
+def _classify_7seg_digit(patch_bin: np.ndarray) -> Tuple[Optional[int], float]:
+    """Classification d’un digit 7-segments + score de confiance (0..1)."""
     h, w = patch_bin.shape[:2]
     # Ecarter le bruit minuscule
     if h < 8 or w < 5:
-        return None
+        return None, 0.0
 
     # Normaliser
     patch = cv2.resize(patch_bin, (32, 48), interpolation=cv2.INTER_NEAREST)
@@ -115,13 +115,25 @@ def _classify_7seg_digit(patch_bin: np.ndarray) -> Optional[int]:
     b = zone(0.18 * H, 0.50 * H, 0.75 * W, 0.95 * W)
     c = zone(0.50 * H, 0.82 * H, 0.75 * W, 0.95 * W)
 
-    seg_on = set()
-    for name, val in zip(SEG_ORDER, [a, b, c, d, e, f, g]):
-        if val >= 0.35:  # seuil empirique
-            seg_on.add(name)
+    seg_vals = dict(zip(SEG_ORDER, [a, b, c, d, e, f, g]))
 
-    digit = DIGIT_MAP.get(frozenset(seg_on))
-    return digit
+    best_digit: Optional[int] = None
+    best_score = -1.0
+    for segs, digit in DIGIT_MAP.items():
+        score = 0.0
+        for name in SEG_ORDER:
+            target = 1.0 if name in segs else 0.0
+            val = float(seg_vals[name])
+            score += max(0.0, 1.0 - abs(val - target))
+        score /= float(len(SEG_ORDER))
+        if score > best_score:
+            best_digit = digit
+            best_score = score
+
+    if best_score < 0.55:
+        return None, float(best_score)
+
+    return best_digit, float(min(1.0, max(0.0, best_score)))
 
 
 def sevenseg_ocr(bgr_or_gray: np.ndarray) -> Tuple[Optional[str], float, np.ndarray]:
@@ -138,16 +150,18 @@ def sevenseg_ocr(bgr_or_gray: np.ndarray) -> Tuple[Optional[str], float, np.ndar
     boxes.sort(key=lambda b: b[0])
 
     digits: List[int] = []
+    digit_scores: List[float] = []
     for (x, y, w, h) in boxes:
         patch = bin_img[y:y + h, x:x + w]
-        d = _classify_7seg_digit(patch)
+        d, score = _classify_7seg_digit(patch)
         if d is None:
             return None, 0.0, cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
         digits.append(d)
+        digit_scores.append(score)
 
     txt = "".join(str(d) for d in digits)
-    # Confiance grossière : plus on détecte de digits, plus on est confiant (sur 3 digits).
-    conf = min(1.0, len(digits) / 3.0)
+    conf = float(np.mean(digit_scores)) if digit_scores else 0.0
+    conf = float(min(1.0, max(0.0, conf)))
 
     dbg = cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
     for (x, y, w, h) in boxes:
