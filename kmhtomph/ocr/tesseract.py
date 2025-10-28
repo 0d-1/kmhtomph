@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any, Set
 
 import re
 import os
@@ -118,6 +118,40 @@ def _apply_morphology(thr: np.ndarray, p: TesseractParams) -> np.ndarray:
     return thr
 
 
+def _ensure_black_on_white(thr: np.ndarray) -> Tuple[np.ndarray, bool]:
+    if thr.ndim != 2 or thr.size == 0:
+        return thr, False
+
+    if thr.dtype != np.uint8:
+        thr = np.clip(thr, 0, 255).astype(np.uint8)
+
+    white = int(np.count_nonzero(thr == 255))
+    black = thr.size - white
+
+    if black > white:
+        return cv2.bitwise_not(thr), True
+    return thr, False
+
+
+def _prepare_for_tesseract(thr: np.ndarray) -> Tuple[np.ndarray, bool]:
+    thr_u8 = thr
+    if thr_u8.dtype != np.uint8:
+        thr_u8 = np.clip(thr_u8, 0, 255).astype(np.uint8)
+
+    thr_u8 = np.ascontiguousarray(thr_u8)
+    oriented, flipped = _ensure_black_on_white(thr_u8)
+    padded = cv2.copyMakeBorder(
+        oriented,
+        4,
+        4,
+        4,
+        4,
+        cv2.BORDER_CONSTANT,
+        value=255,
+    )
+    return padded, flipped
+
+
 def _prep_for_ocr(gray_in: np.ndarray, p: TesseractParams) -> Tuple[np.ndarray, np.ndarray]:
     g = _make_gray(gray_in)
     # upscale
@@ -199,7 +233,7 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
     return cropped if cropped.size else img
 
 
-def _run_tesseract(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
+def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
     data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
 
     # Extraire texte brut + confiance
@@ -232,8 +266,15 @@ def _run_tesseract(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], 
 
 def _tess_config(p: TesseractParams) -> str:
     wl = p.whitelist + (".," if p.allow_dot else "")
-    config = f"--psm {int(p.psm)} --oem {int(p.oem)} -c tessedit_char_whitelist={wl}"
-    return config
+    config_parts = [
+        f"--psm {int(p.psm)}",
+        f"--oem {int(p.oem)}",
+        f"-c tessedit_char_whitelist={wl}",
+        "-c classify_bln_numeric_mode=1",
+        "-c load_system_dawg=0",
+        "-c load_freq_dawg=0",
+    ]
+    return " ".join(config_parts)
 
 
 def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
@@ -244,26 +285,58 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
         gray_proc = _crop_to_bounds(gray_proc, bounds)
         thr_main = _crop_to_bounds(thr_main, bounds)
 
-    variants: List[np.ndarray] = [thr_main, cv2.bitwise_not(thr_main)]
+    base_variants: List[np.ndarray] = [thr_main]
 
     if _looks_mostly_blank(thr_main):
         thr_adapt = _adaptive_binarize(gray_proc, p)
         if bounds and thr_adapt.shape != thr_main.shape:
             thr_adapt = _crop_to_bounds(thr_adapt, bounds)
-        variants.append(thr_adapt)
-        variants.append(cv2.bitwise_not(thr_adapt))
+        base_variants.append(thr_adapt)
 
-    best: Tuple[Optional[str], float, np.ndarray] = (
-        None,
-        0.0,
-        cv2.cvtColor(gray_proc if gray_proc.size else gray_in, cv2.COLOR_GRAY2BGR),
-    )
-    for thr in variants:
-        txt, conf, dbg = _run_tesseract(thr, p)
-        if conf >= best[1]:
-            best = (txt, conf, dbg)
+    fallback_dbg = cv2.cvtColor(gray_proc if gray_proc.size else gray_in, cv2.COLOR_GRAY2BGR)
 
-    return best
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    seen: Set[bytes] = set()
+
+    for variant in base_variants:
+        for candidate in (variant, cv2.bitwise_not(variant)):
+            prepared, _ = _prepare_for_tesseract(candidate)
+            sig = prepared.tobytes()
+            if sig in seen:
+                continue
+            seen.add(sig)
+
+            txt, conf, dbg = _run_tesseract_prepared(prepared, p)
+            key = txt if txt else ""
+            info = aggregated.setdefault(
+                key,
+                {"hits": 0, "total": 0.0, "max": 0.0, "dbg": dbg, "len": len(key)},
+            )
+            info["hits"] += 1
+            info["total"] += float(conf)
+            if conf >= info["max"]:
+                info["max"] = float(conf)
+                info["dbg"] = dbg
+
+    if not aggregated:
+        return None, 0.0, fallback_dbg
+
+    def _score(item: Tuple[str, Dict[str, Any]]) -> Tuple[int, int, float, float, int]:
+        key, info = item
+        return (
+            1 if key else 0,
+            int(info.get("hits", 0)),
+            float(info.get("total", 0.0)),
+            float(info.get("max", 0.0)),
+            int(info.get("len", len(key))),
+        )
+
+    best_key, best_info = max(aggregated.items(), key=_score)
+    best_txt = best_key if best_key else None
+    best_conf = float(best_info.get("max", 0.0))
+    best_dbg = best_info.get("dbg") or fallback_dbg
+
+    return best_txt, best_conf, best_dbg
 
 
 def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = None) -> Tuple[Optional[str], float, np.ndarray]:
