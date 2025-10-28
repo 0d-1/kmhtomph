@@ -96,7 +96,9 @@ def choose_best_kmh(
             _reset_memory(state)
             return None
 
-    state.last_kmh = float(best_v)
     state.win.add(float(best_v))
+    median_after = state.win.median()
+    smoothed = float(median_after if median_after is not None else best_v)
+    state.last_kmh = smoothed
     state.miss_streak = 0
-    return float(best_v)
+    return smoothed
