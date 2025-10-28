@@ -334,7 +334,9 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
     best_key, best_info = max(aggregated.items(), key=_score)
     best_txt = best_key if best_key else None
     best_conf = float(best_info.get("max", 0.0))
-    best_dbg = best_info.get("dbg") or fallback_dbg
+    best_dbg = best_info.get("dbg")
+    if best_dbg is None:
+        best_dbg = fallback_dbg
 
     return best_txt, best_conf, best_dbg
 
