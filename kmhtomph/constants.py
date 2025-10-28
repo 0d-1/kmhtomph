@@ -11,6 +11,9 @@ from typing import Tuple
 # Conversion
 KMH_TO_MPH: float = 0.621371192237334  # 1 km/h = 0.62137 mph
 
+# Valeurs aberrantes
+MAX_REASONABLE_KMH: float = 500.0
+
 # Texte incrusté (overlay) par défaut
 DEFAULT_FONT_FAMILY: str = "DejaVu Sans"
 DEFAULT_FONT_POINT_SIZE: int = 28
@@ -33,12 +36,12 @@ class AntiJitterConfig:
     - min_confidence: score mini pour accepter la valeur (0..1)
     - hold_max_gap_frames: nb de frames à “tenir” la dernière valeur quand tout rate
     """
-    window_size: int = 5
-    # Ajusté pour des FPS typiques (25–60) : 2.5 km/h par frame est bien plus réaliste que 8.0
-    max_delta_kmh: float = 2.5
-    min_confidence: float = 0.5
+    window_size: int = 7
+    # Ajusté pour des FPS typiques (25–60) : on privilégie des transitions plus douces.
+    max_delta_kmh: float = 2.0
+    min_confidence: float = 0.55
     # NEW: maintien configurable de la dernière valeur quand on a des trous
-    hold_max_gap_frames: int = 6
+    hold_max_gap_frames: int = 8
 
 
 DEFAULT_ANTI_JITTER = AntiJitterConfig()

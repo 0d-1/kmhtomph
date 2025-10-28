@@ -244,7 +244,7 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
         gray_proc = _crop_to_bounds(gray_proc, bounds)
         thr_main = _crop_to_bounds(thr_main, bounds)
 
-    variants: List[np.ndarray] = [thr_main]
+    variants: List[np.ndarray] = [thr_main, cv2.bitwise_not(thr_main)]
 
     if _looks_mostly_blank(thr_main):
         thr_adapt = _adaptive_binarize(gray_proc, p)
@@ -253,7 +253,11 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
         variants.append(thr_adapt)
         variants.append(cv2.bitwise_not(thr_adapt))
 
-    best: Tuple[Optional[str], float, np.ndarray] = (None, 0.0, cv2.cvtColor(thr_main, cv2.COLOR_GRAY2BGR))
+    best: Tuple[Optional[str], float, np.ndarray] = (
+        None,
+        0.0,
+        cv2.cvtColor(gray_proc if gray_proc.size else gray_in, cv2.COLOR_GRAY2BGR),
+    )
     for thr in variants:
         txt, conf, dbg = _run_tesseract(thr, p)
         if conf >= best[1]:
@@ -292,6 +296,5 @@ def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = N
     # Retour meilleur trouvé
     t, c, dbg = best
     if dbg is None:
-        h, w = g.shape[:2]
-        dbg = np.zeros((max(1, h // 2), max(1, w // 2), 3), np.uint8)
+        dbg = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     return (t if t else None), float(c), dbg
