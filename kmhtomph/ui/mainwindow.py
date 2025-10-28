@@ -6,7 +6,7 @@ barre de progression + raccourcis, extraction ROI par homographie exacte.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Optional
+from typing import Optional, List
 
 import copy
 import math
@@ -31,6 +31,7 @@ from ..constants import (
     AntiJitterConfig,
 )
 from ..ocr import OCRPipeline
+from ..ocr.chooser import centered_median_smoothing
 from ..ocr.tesseract import auto_locate_tesseract
 from ..video.io import VideoReader
 from ..video.exporter import export_video, ExportParams
@@ -234,11 +235,17 @@ class MainWindow(QMainWindow):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         smoothing_group.setLayout(form)
 
-        self.spin_smooth_window = QSpinBox(smoothing_group)
-        self.spin_smooth_window.setRange(1, 31)
-        self.spin_smooth_window.setValue(int(self.ocr.anti_jitter.window_size))
-        self.spin_smooth_window.setToolTip("Nombre d'images utilisées pour la médiane.")
-        form.addRow("Fenêtre médiane", self.spin_smooth_window)
+        self.spin_smooth_past = QSpinBox(smoothing_group)
+        self.spin_smooth_past.setRange(0, 31)
+        self.spin_smooth_past.setValue(int(self.ocr.anti_jitter.median_past_frames))
+        self.spin_smooth_past.setToolTip("Nombre d'images en amont utilisées pour la médiane centrée.")
+        form.addRow("Passé (frames)", self.spin_smooth_past)
+
+        self.spin_smooth_future = QSpinBox(smoothing_group)
+        self.spin_smooth_future.setRange(0, 31)
+        self.spin_smooth_future.setValue(int(self.ocr.anti_jitter.median_future_frames))
+        self.spin_smooth_future.setToolTip("Nombre d'images en aval utilisées pour la médiane centrée.")
+        form.addRow("Futur (frames)", self.spin_smooth_future)
 
         self.spin_smooth_delta = QDoubleSpinBox(smoothing_group)
         self.spin_smooth_delta.setDecimals(1)
@@ -263,7 +270,8 @@ class MainWindow(QMainWindow):
         self.spin_smooth_hold.setToolTip("Nombre de frames durant lesquelles conserver la dernière valeur fiable.")
         form.addRow("Maintien (frames)", self.spin_smooth_hold)
 
-        self.spin_smooth_window.valueChanged.connect(self._on_smoothing_params_changed)
+        self.spin_smooth_past.valueChanged.connect(self._on_smoothing_params_changed)
+        self.spin_smooth_future.valueChanged.connect(self._on_smoothing_params_changed)
         self.spin_smooth_delta.valueChanged.connect(self._on_smoothing_params_changed)
         self.spin_smooth_conf.valueChanged.connect(self._on_smoothing_params_changed)
         self.spin_smooth_hold.valueChanged.connect(self._on_smoothing_params_changed)
@@ -319,26 +327,37 @@ class MainWindow(QMainWindow):
 
     def _collect_smoothing_config(self) -> AntiJitterConfig:
         return AntiJitterConfig(
-            window_size=int(self.spin_smooth_window.value()),
+            median_past_frames=int(self.spin_smooth_past.value()),
+            median_future_frames=int(self.spin_smooth_future.value()),
             max_delta_kmh=float(self.spin_smooth_delta.value()),
             min_confidence=float(self.spin_smooth_conf.value()),
             hold_max_gap_frames=int(self.spin_smooth_hold.value()),
         )
 
     def _load_smoothing_settings(self) -> None:
-        if not hasattr(self, "spin_smooth_window"):
+        if not hasattr(self, "spin_smooth_past"):
             return
 
         self._loading_smoothing_settings = True
         try:
             cfg = self.ocr.anti_jitter
-            window = self._settings.value("smoothing/window_size", cfg.window_size, type=int)
+            past = self._settings.value("smoothing/past_frames", cfg.median_past_frames, type=int)
+            future = self._settings.value("smoothing/future_frames", cfg.median_future_frames, type=int)
+            legacy_window = self._settings.value("smoothing/window_size", None, type=int)
             delta = self._settings.value("smoothing/max_delta", cfg.max_delta_kmh, type=float)
             conf = self._settings.value("smoothing/min_confidence", cfg.min_confidence, type=float)
             hold = self._settings.value("smoothing/hold_frames", cfg.hold_max_gap_frames, type=int)
 
-            if window is None:
-                window = cfg.window_size
+            if past is None:
+                past = cfg.median_past_frames
+            if future is None:
+                future = cfg.median_future_frames
+            if legacy_window is not None and past == cfg.median_past_frames and future == cfg.median_future_frames:
+                legacy_window = max(1, int(legacy_window))
+                legacy_past = max(0, (legacy_window - 1) // 2)
+                legacy_future = max(0, legacy_window - 1 - legacy_past)
+                past = legacy_past
+                future = legacy_future
             if delta is None:
                 delta = cfg.max_delta_kmh
             if conf is None:
@@ -346,9 +365,13 @@ class MainWindow(QMainWindow):
             if hold is None:
                 hold = cfg.hold_max_gap_frames
 
-            self.spin_smooth_window.blockSignals(True)
-            self.spin_smooth_window.setValue(int(window))
-            self.spin_smooth_window.blockSignals(False)
+            self.spin_smooth_past.blockSignals(True)
+            self.spin_smooth_past.setValue(int(past))
+            self.spin_smooth_past.blockSignals(False)
+
+            self.spin_smooth_future.blockSignals(True)
+            self.spin_smooth_future.setValue(int(future))
+            self.spin_smooth_future.blockSignals(False)
 
             self.spin_smooth_delta.blockSignals(True)
             self.spin_smooth_delta.setValue(float(delta))
@@ -368,7 +391,8 @@ class MainWindow(QMainWindow):
         self.ocr.set_anti_jitter_config(config)
 
     def _save_smoothing_settings(self, config: AntiJitterConfig) -> None:
-        self._settings.setValue("smoothing/window_size", int(config.window_size))
+        self._settings.setValue("smoothing/past_frames", int(config.median_past_frames))
+        self._settings.setValue("smoothing/future_frames", int(config.median_future_frames))
         self._settings.setValue("smoothing/max_delta", float(config.max_delta_kmh))
         self._settings.setValue("smoothing/min_confidence", float(config.min_confidence))
         self._settings.setValue("smoothing/hold_frames", int(config.hold_max_gap_frames))
@@ -1050,8 +1074,55 @@ class MainWindow(QMainWindow):
         style = self.overlay_style
         out_cx, out_cy, out_w, out_h, out_ang = self.canvas.get_overlay_rect()
 
-        export_ocr = copy.deepcopy(self.ocr)
-        export_ocr.reset()
+        precalc_ocr = copy.deepcopy(self.ocr)
+        precalc_ocr.reset()
+
+        precomp_reader = VideoReader(src)
+        try:
+            precomp_reader.open()
+        except Exception as e:
+            try:
+                new_reader.release()
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Export", f"Impossible de préparer la source : {e}")
+            return
+
+        mph_sequence: List[Optional[float]] = []
+        precalc_error: Optional[Exception] = None
+        try:
+            while True:
+                ok_calc, frame_calc = precomp_reader.read()
+                if not ok_calc or frame_calc is None:
+                    break
+                roi_calc = _extract_roi_from_corners(frame_calc, base_corners, w, h)
+                try:
+                    kmh_val, _, _, _ = precalc_ocr.read_kmh(roi_calc, mode=self.ocr_mode)
+                except (TesseractNotFoundError, FileNotFoundError) as e:
+                    self._handle_tesseract_error(e)
+                    precalc_error = e
+                    break
+                mph_sequence.append(kmh_val * KMH_TO_MPH if kmh_val is not None else None)
+        finally:
+            try:
+                precomp_reader.release()
+            except Exception:
+                pass
+
+        if precalc_error is not None:
+            try:
+                new_reader.release()
+            except Exception:
+                pass
+            return
+
+        cfg = precalc_ocr.anti_jitter
+        smoothed_mph = centered_median_smoothing(
+            mph_sequence,
+            cfg.median_past_frames,
+            cfg.median_future_frames,
+        )
+        smoothed_texts = [format_speed_text(v) if v is not None else None for v in smoothed_mph]
 
         fps_for_range = float(new_reader.fps or self._fps())
         known_total_frames = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
@@ -1065,7 +1136,6 @@ class MainWindow(QMainWindow):
             and end_frame >= start_frame
             and end_frame >= 0
         )
-        range_state = {"active": False}
 
         last_mph_value = {"value": None}
         last_text_value = {"text": None}
@@ -1076,30 +1146,21 @@ class MainWindow(QMainWindow):
 
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
             if range_enabled and (idx < start_frame or idx > end_frame):
-                if range_state["active"]:
-                    export_ocr.reset()
-                    range_state["active"] = False
                 _reset_last_values()
                 return None
-            if not range_state["active"]:
-                export_ocr.reset()
-                range_state["active"] = True
-                _reset_last_values()
-            # Recalcule une fois (si on souhaite geler la position au début) : ici on garde base_corners
-            roi_bgr = _extract_roi_from_corners(frame_bgr, base_corners, w, h)
-            try:
-                kmh, debug_bgr, score, details = export_ocr.read_kmh(roi_bgr, mode=self.ocr_mode)
-            except (TesseractNotFoundError, FileNotFoundError) as e:
-                self._handle_tesseract_error(e)
-                raise RuntimeError("Tesseract introuvable") from e
-            if kmh is None:
+            if idx < len(smoothed_mph):
+                mph_val = smoothed_mph[idx]
+            else:
+                mph_val = None
+            if mph_val is None:
                 cached_text = last_text_value["text"]
                 if cached_text:
                     return cached_text
                 return None
-            mph = kmh * KMH_TO_MPH
-            last_mph_value["value"] = mph
-            text = format_speed_text(mph)
+            last_mph_value["value"] = mph_val
+            text = smoothed_texts[idx] if idx < len(smoothed_texts) else None
+            if text is None:
+                text = format_speed_text(mph_val)
             last_text_value["text"] = text
             return text
 
