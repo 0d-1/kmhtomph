@@ -180,21 +180,22 @@ def render_text_pane_qt(text: str, style: OverlayStyle) -> QImage:
 
 
 def _qimage_to_bgra_numpy(img: QImage) -> np.ndarray:
-    """Convertit un QImage ARGB32_Premultiplied en np.ndarray BGRA (uint8)."""
+    """Convertit un QImage en np.ndarray BGRA (uint8) avec couleurs prémultipliées."""
     assert img.format() in (
         QImage.Format_ARGB32,
         QImage.Format_ARGB32_Premultiplied,
         QImage.Format_RGBA8888,
         QImage.Format_RGBA8888_Premultiplied,
     ), "QImage doit être ARGB32/RGBA8888"
-    img = img.convertToFormat(QImage.Format_RGBA8888)
+    if img.format() != QImage.Format_ARGB32_Premultiplied:
+        img = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
     w = img.width()
     h = img.height()
     ptr = img.constBits()
     ptr.setsize(h * img.bytesPerLine())
     arr = np.frombuffer(ptr, np.uint8).reshape((h, img.bytesPerLine() // 4, 4))[:, :w, :]
-    # RGBA -> BGRA
-    bgra = arr[:, :, ::-1].copy()
+    # Format Qt : ARGB prémultiplié -> convertir en BGRA prémultiplié
+    bgra = arr[:, :, [2, 1, 0, 3]].copy()
     return bgra
 
 
@@ -219,11 +220,15 @@ def _alpha_blend_bgra(dst_bgr: np.ndarray, src_bgra: np.ndarray, top_left_xy: Tu
     dst_roi = dst_bgr[y0:y1, x0:x1, :]
 
     alpha = src_roi[:, :, 3:4].astype(np.float32) / 255.0
-    src_rgb = src_roi[:, :, :3].astype(np.float32)
-    dst_rgb = dst_roi.astype(np.float32)
+    if not np.any(alpha > 0):
+        return
 
-    out = src_rgb * alpha + dst_rgb * (1.0 - alpha)
-    dst_roi[:] = out.astype(np.uint8)
+    # Les composantes sont déjà prémultipliées par alpha (voir _qimage_to_bgra_numpy)
+    src_rgb = src_roi[:, :, :3].astype(np.float32) / 255.0
+    dst_rgb = dst_roi.astype(np.float32) / 255.0
+
+    out = src_rgb + dst_rgb * (1.0 - alpha)
+    dst_roi[:] = np.clip(out * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
 def paste_text_rotated(

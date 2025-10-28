@@ -8,6 +8,9 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Optional
 
+import copy
+import math
+
 import numpy as np
 import cv2
 
@@ -88,6 +91,19 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("kmhtomph", "kmh_to_mph")
         self._tesseract_error_shown = False
 
+        self._loading_range_settings = False
+        self.transcription_range_enabled = bool(
+            self._settings.value("range/enabled", False, type=bool)
+        )
+        self.transcription_start_sec = self._coerce_float(
+            self._settings.value("range/start_sec"),
+            0.0,
+        )
+        self.transcription_end_sec = self._coerce_float(
+            self._settings.value("range/end_sec"),
+            0.0,
+        )
+
         self._tesseract_path: Optional[str] = None
         stored_path = self._settings.value("tesseract/path", type=str)
         if stored_path:
@@ -165,6 +181,7 @@ class MainWindow(QMainWindow):
         prog_bar.addWidget(self.lbl_time)
 
         self.side_panel = self._create_side_panel()
+        self._configure_range_controls(0.0)
         self._update_debug_preview_geometry()
         self._load_smoothing_settings()
         self._refresh_debug_thumbnail()
@@ -253,6 +270,38 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(smoothing_group)
 
+        range_group = QGroupBox("Plage de transcription", panel)
+        range_layout = QVBoxLayout(range_group)
+        range_layout.setContentsMargins(9, 9, 9, 9)
+        range_layout.setSpacing(6)
+
+        self.chk_range_enable = QCheckBox("Limiter la transcription à une plage", range_group)
+        self.chk_range_enable.stateChanged.connect(self._on_range_toggle)
+        range_layout.addWidget(self.chk_range_enable)
+
+        range_form = QFormLayout()
+        range_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.spin_range_start = QDoubleSpinBox(range_group)
+        self.spin_range_start.setDecimals(2)
+        self.spin_range_start.setSingleStep(0.1)
+        self.spin_range_start.setRange(0.0, 0.0)
+        self.spin_range_start.setSuffix(" s")
+        self.spin_range_start.valueChanged.connect(self._on_range_start_changed)
+
+        self.spin_range_end = QDoubleSpinBox(range_group)
+        self.spin_range_end.setDecimals(2)
+        self.spin_range_end.setSingleStep(0.1)
+        self.spin_range_end.setRange(0.0, 0.0)
+        self.spin_range_end.setSuffix(" s")
+        self.spin_range_end.valueChanged.connect(self._on_range_end_changed)
+
+        range_form.addRow("Début (s)", self.spin_range_start)
+        range_form.addRow("Fin (s)", self.spin_range_end)
+        range_layout.addLayout(range_form)
+
+        layout.addWidget(range_group)
+
         layout.addStretch(1)
 
         self.debug_label_title = QLabel("Vignette debug", panel)
@@ -331,6 +380,174 @@ class MainWindow(QMainWindow):
         config = self._collect_smoothing_config()
         self.ocr.set_anti_jitter_config(config)
         self._save_smoothing_settings(config)
+
+    def _save_range_settings(self) -> None:
+        self._settings.setValue("range/enabled", bool(self.transcription_range_enabled))
+        self._settings.setValue("range/start_sec", float(self.transcription_start_sec))
+        self._settings.setValue("range/end_sec", float(self.transcription_end_sec))
+        self._settings.sync()
+
+    def _configure_range_controls(self, total_seconds: float) -> None:
+        if not hasattr(self, "spin_range_start"):
+            return
+
+        total_seconds = max(0.0, float(total_seconds))
+        self._loading_range_settings = True
+        try:
+            for spin in (self.spin_range_start, self.spin_range_end):
+                spin.setMinimum(0.0)
+                spin.setMaximum(total_seconds)
+
+            if total_seconds <= 0.0:
+                self.spin_range_start.setValue(0.0)
+                self.spin_range_end.setValue(0.0)
+                self.spin_range_start.setEnabled(False)
+                self.spin_range_end.setEnabled(False)
+                self.chk_range_enable.setChecked(False)
+                self.transcription_range_enabled = False
+                self.transcription_start_sec = 0.0
+                self.transcription_end_sec = 0.0
+            else:
+                # Clamp stored values within the duration
+                start = min(max(0.0, self.transcription_start_sec), total_seconds)
+                if self.transcription_end_sec <= 0.0:
+                    end = total_seconds
+                else:
+                    end = min(max(self.transcription_end_sec, start), total_seconds)
+
+                self.transcription_start_sec = start
+                self.transcription_end_sec = max(start, end)
+
+                self.spin_range_start.setValue(self.transcription_start_sec)
+                self.spin_range_end.setValue(self.transcription_end_sec)
+
+                self.chk_range_enable.setChecked(bool(self.transcription_range_enabled))
+                self.spin_range_start.setEnabled(self.transcription_range_enabled)
+                self.spin_range_end.setEnabled(self.transcription_range_enabled)
+        finally:
+            self._loading_range_settings = False
+
+        self._save_range_settings()
+        self._refresh_overlay_for_range()
+
+    def _on_range_toggle(self, state: int) -> None:
+        if not hasattr(self, "spin_range_start"):
+            return
+        enabled = state == Qt.Checked and self.spin_range_start.maximum() > 0.0
+        self.transcription_range_enabled = enabled
+        self.spin_range_start.setEnabled(enabled)
+        self.spin_range_end.setEnabled(enabled)
+        if not self._loading_range_settings:
+            self._save_range_settings()
+            self._refresh_overlay_for_range()
+
+    def _on_range_start_changed(self, value: float) -> None:
+        if self._loading_range_settings:
+            return
+        start = max(0.0, float(value))
+        end = float(self.spin_range_end.value())
+        if start > end:
+            self.spin_range_end.blockSignals(True)
+            self.spin_range_end.setValue(start)
+            self.spin_range_end.blockSignals(False)
+            end = start
+        self.transcription_start_sec = start
+        self.transcription_end_sec = max(start, end)
+        self._save_range_settings()
+        self._refresh_overlay_for_range()
+
+    def _on_range_end_changed(self, value: float) -> None:
+        if self._loading_range_settings:
+            return
+        end = max(0.0, float(value))
+        start = float(self.spin_range_start.value())
+        if end < start:
+            self.spin_range_start.blockSignals(True)
+            self.spin_range_start.setValue(end)
+            self.spin_range_start.blockSignals(False)
+            start = end
+        self.transcription_end_sec = end
+        self.transcription_start_sec = min(start, end)
+        self._save_range_settings()
+        self._refresh_overlay_for_range()
+
+    def _has_transcription_range(self) -> bool:
+        return bool(
+            self.transcription_range_enabled
+            and self.transcription_end_sec > self.transcription_start_sec
+            and self._total_frames() > 0
+        )
+
+    def _transcription_range_frame_bounds(
+        self,
+        *,
+        fps: Optional[float] = None,
+        total_frames: Optional[int] = None,
+    ) -> tuple[int, int]:
+        if total_frames is None:
+            total_frames = self._total_frames()
+        total = max(0, int(total_frames))
+        if total <= 0:
+            return 0, -1
+
+        if fps is None:
+            fps = self._fps()
+        fps = max(float(fps), 1e-6)
+
+        if not self.transcription_range_enabled:
+            return 0, total - 1
+
+        start_sec = max(0.0, self.transcription_start_sec)
+        end_sec = self.transcription_end_sec
+        if end_sec <= 0.0:
+            end_sec = total / fps
+        end_sec = max(start_sec, end_sec)
+
+        start_idx = int(math.floor(start_sec * fps + 1e-6))
+        end_idx = int(math.floor(end_sec * fps + 1e-6))
+        start_idx = max(0, min(start_idx, total - 1))
+        end_idx = max(0, min(end_idx, total - 1))
+        if end_idx < start_idx:
+            end_idx = start_idx
+        return start_idx, end_idx
+
+    def _frame_in_transcription_range(self, frame_idx: int) -> bool:
+        if not self.transcription_range_enabled:
+            return True
+        start, end = self._transcription_range_frame_bounds()
+        if end < start:
+            return False
+        return start <= frame_idx <= end
+
+    def _current_frame_index(self) -> Optional[int]:
+        if not self.reader or not self.reader.is_opened():
+            return None
+        try:
+            return int(self.reader.get_pos_frame())
+        except Exception:
+            fps = self._fps()
+            if fps <= 0:
+                return 0
+            ms = self.reader.get_pos_msec()
+            return int(round((ms / 1000.0) * fps))
+
+    def _refresh_overlay_for_range(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        if not self.reader or not self.reader.is_opened():
+            if self.transcription_range_enabled:
+                self._set_overlay_text(None, allow_placeholder=True, force_clear=True)
+            return
+        frame_idx = self._current_frame_index()
+        if frame_idx is None:
+            return
+        if self._frame_in_transcription_range(frame_idx):
+            if self._last_overlay_text:
+                self._set_overlay_text(self._last_overlay_text)
+            else:
+                self._set_overlay_text(None, allow_placeholder=True)
+        else:
+            self._set_overlay_text(None, force_clear=True)
 
     def _update_debug_preview_geometry(self) -> None:
         if not hasattr(self, "debug_preview"):
@@ -421,14 +638,23 @@ class MainWindow(QMainWindow):
             self._save_overlay_style()
             self._set_overlay_text(self._last_overlay_text, allow_placeholder=True)
 
-    def _set_overlay_text(self, text: Optional[str], *, allow_placeholder: bool = False) -> None:
-        display = text
-        if text:
-            self._last_overlay_text = text
+    def _set_overlay_text(
+        self,
+        text: Optional[str],
+        *,
+        allow_placeholder: bool = False,
+        force_clear: bool = False,
+    ) -> None:
+        if force_clear:
+            display = "-- mph" if allow_placeholder else None
         else:
-            display = self._last_overlay_text
-        if display is None and allow_placeholder:
-            display = "-- mph"
+            display = text
+            if text:
+                self._last_overlay_text = text
+            else:
+                display = self._last_overlay_text
+                if display is None and allow_placeholder:
+                    display = "-- mph"
         self.canvas.set_overlay_preview(display, self.overlay_style)
 
     @staticmethod
@@ -460,6 +686,15 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
         return r, g, b, a
+
+    @staticmethod
+    def _coerce_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
 
     def _load_overlay_style(self, base: OverlayStyle) -> OverlayStyle:
         style = base
@@ -604,6 +839,7 @@ class MainWindow(QMainWindow):
 
             total_seconds = (self._total_frames() / self._fps()) if self._total_frames() > 0 else 0.0
             self.lbl_time.setText(f"{self._format_hms(target_frame / self._fps())} / {self._format_hms(total_seconds)}")
+            self._refresh_overlay_for_range()
         finally:
             self._seeking = False
 
@@ -651,6 +887,8 @@ class MainWindow(QMainWindow):
         total_seconds = (total_frames / fps) if (total_frames > 0 and fps > 0) else 0.0
         self.lbl_time.setText(f"00:00 / {self._format_hms(total_seconds)}")
 
+        self._configure_range_controls(total_seconds)
+
         self.canvas.set_frame(frame)
         self.canvas.fit_roi_to_frame()
         self.lbl_kmh.setText("-- km/h")
@@ -659,6 +897,7 @@ class MainWindow(QMainWindow):
         self._set_overlay_text(None, allow_placeholder=True)
         self.ocr.reset()
         self._set_debug_thumbnail(None)
+        self._refresh_overlay_for_range()
 
     def _on_toggle_play(self):
         if not self.reader or not self.reader.is_opened():
@@ -696,22 +935,30 @@ class MainWindow(QMainWindow):
         else:
             self._set_debug_thumbnail(None)
 
+        mph_text: Optional[str] = None
         if kmh is not None:
             mph = kmh * KMH_TO_MPH
             mph_text = format_speed_text(mph)
             self.lbl_kmh.setText(f"{kmh:.0f} km/h")
             self.lbl_mph.setText(mph_text)
-            self._set_overlay_text(mph_text)
         else:
             self.lbl_kmh.setText("-- km/h")
             self.lbl_mph.setText("-- mph")
-            self._set_overlay_text(None, allow_placeholder=True)
 
         # --- progression ---
         cur_ms = self.reader.get_pos_msec()
         fps = self._fps()
         cur_frame = int(round((cur_ms / 1000.0) * fps)) if fps > 0 else 0
         total_frames = self._total_frames()
+
+        in_range = self._frame_in_transcription_range(cur_frame)
+        if in_range:
+            if mph_text:
+                self._set_overlay_text(mph_text)
+            else:
+                self._set_overlay_text(None, allow_placeholder=True)
+        else:
+            self._set_overlay_text(None, force_clear=True)
 
         if not self._seeking and self.slider.isEnabled():
             self.slider.blockSignals(True)
@@ -803,13 +1050,35 @@ class MainWindow(QMainWindow):
         style = self.overlay_style
         out_cx, out_cy, out_w, out_h, out_ang = self.canvas.get_overlay_rect()
 
+        export_ocr = copy.deepcopy(self.ocr)
+        export_ocr.reset()
+
+        fps_for_range = float(new_reader.fps or self._fps())
+        known_total_frames = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
+        start_frame, end_frame = self._transcription_range_frame_bounds(
+            fps=fps_for_range,
+            total_frames=known_total_frames,
+        )
+        range_enabled = (
+            self.transcription_range_enabled
+            and known_total_frames is not None
+            and end_frame >= start_frame
+            and end_frame >= 0
+        )
+        range_state = {"active": False}
+
         last_mph_value = {"value": None}
 
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
+            if range_enabled and (idx < start_frame or idx > end_frame):
+                return None
+            if not range_state["active"]:
+                export_ocr.reset()
+                range_state["active"] = True
             # Recalcule une fois (si on souhaite geler la position au début) : ici on garde base_corners
             roi_bgr = _extract_roi_from_corners(frame_bgr, base_corners, w, h)
             try:
-                kmh, debug_bgr, score, details = self.ocr.read_kmh(roi_bgr, mode=self.ocr_mode)
+                kmh, debug_bgr, score, details = export_ocr.read_kmh(roi_bgr, mode=self.ocr_mode)
             except (TesseractNotFoundError, FileNotFoundError) as e:
                 self._handle_tesseract_error(e)
                 raise RuntimeError("Tesseract introuvable") from e
@@ -905,11 +1174,13 @@ class MainWindow(QMainWindow):
             ok, frame = self.reader.read()
             if ok and frame is not None:
                 self.canvas.set_frame(frame)
+                self._refresh_overlay_for_range()
             else:
                 self.reader.set_pos_frame(max(0, target_frame - 1))
                 ok, frame = self.reader.read()
                 if ok and frame is not None:
                     self.canvas.set_frame(frame)
+                    self._refresh_overlay_for_range()
         finally:
             self._seeking = False
             if self._was_playing_before_seek:
