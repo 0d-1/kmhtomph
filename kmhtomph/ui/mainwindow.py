@@ -1068,13 +1068,23 @@ class MainWindow(QMainWindow):
         range_state = {"active": False}
 
         last_mph_value = {"value": None}
+        last_text_value = {"text": None}
+
+        def _reset_last_values() -> None:
+            last_mph_value["value"] = None
+            last_text_value["text"] = None
 
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
             if range_enabled and (idx < start_frame or idx > end_frame):
+                if range_state["active"]:
+                    export_ocr.reset()
+                    range_state["active"] = False
+                _reset_last_values()
                 return None
             if not range_state["active"]:
                 export_ocr.reset()
                 range_state["active"] = True
+                _reset_last_values()
             # Recalcule une fois (si on souhaite geler la position au début) : ici on garde base_corners
             roi_bgr = _extract_roi_from_corners(frame_bgr, base_corners, w, h)
             try:
@@ -1083,10 +1093,15 @@ class MainWindow(QMainWindow):
                 self._handle_tesseract_error(e)
                 raise RuntimeError("Tesseract introuvable") from e
             if kmh is None:
+                cached_text = last_text_value["text"]
+                if cached_text:
+                    return cached_text
                 return None
             mph = kmh * KMH_TO_MPH
             last_mph_value["value"] = mph
-            return format_speed_text(mph)
+            text = format_speed_text(mph)
+            last_text_value["text"] = text
+            return text
 
         def draw_overlay(frame_bgr: np.ndarray, text: str) -> None:
             value = last_mph_value["value"]
