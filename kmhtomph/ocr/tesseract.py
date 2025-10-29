@@ -291,43 +291,6 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
             )
         )
 
-    base_variants: List[np.ndarray] = []
-
-    for gray_proc, thr_main in sources:
-        if thr_main.size:
-            base_variants.append(thr_main)
-
-            if _looks_mostly_blank(thr_main):
-                thr_adapt = _adaptive_binarize(gray_proc, p)
-                base_variants.append(thr_adapt)
-
-        if gray_proc.size == 0:
-            continue
-
-        raw_thr = _binarize(gray_proc)
-        base_variants.append(raw_thr)
-
-        inv_thr = cv2.threshold(gray_proc, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-        base_variants.append(inv_thr)
-
-        if p.morph_close:
-            close_variant = cv2.morphologyEx(
-                raw_thr,
-                cv2.MORPH_CLOSE,
-                np.ones((2, 2), np.uint8),
-                iterations=1,
-            )
-            base_variants.append(close_variant)
-
-        if p.morph_open:
-            open_variant = cv2.morphologyEx(
-                raw_thr,
-                cv2.MORPH_OPEN,
-                np.ones((2, 2), np.uint8),
-                iterations=1,
-            )
-            base_variants.append(open_variant)
-
     fallback_dbg = cv2.cvtColor(
         gray_proc_full if gray_proc_full.size else gray_in,
         cv2.COLOR_GRAY2BGR,
@@ -336,27 +299,60 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
     aggregated: Dict[str, Dict[str, Any]] = {}
     seen: Set[bytes] = set()
 
-    for variant in base_variants:
-        if variant is None or variant.size == 0:
-            continue
-        for candidate in (variant, cv2.bitwise_not(variant)):
-            prepared, _ = _prepare_for_tesseract(candidate)
-            sig = prepared.tobytes()
-            if sig in seen:
-                continue
-            seen.add(sig)
+    def _record_candidate(thr_variant: np.ndarray) -> None:
+        if thr_variant is None or thr_variant.size == 0:
+            return
+        prepared, _ = _prepare_for_tesseract(thr_variant)
+        sig = prepared.tobytes()
+        if sig in seen:
+            return
+        seen.add(sig)
 
-            txt, conf, dbg = _run_tesseract_prepared(prepared, p)
-            key = txt if txt else ""
-            info = aggregated.setdefault(
-                key,
-                {"hits": 0, "total": 0.0, "max": 0.0, "dbg": dbg, "len": len(key)},
-            )
-            info["hits"] += 1
-            info["total"] += float(conf)
-            if conf >= info["max"]:
-                info["max"] = float(conf)
-                info["dbg"] = dbg
+        txt, conf, dbg = _run_tesseract_prepared(prepared, p)
+        key = txt if txt else ""
+        info = aggregated.setdefault(
+            key,
+            {"hits": 0, "total": 0.0, "max": 0.0, "dbg": dbg, "len": len(key)},
+        )
+        info["hits"] += 1
+        info["total"] += float(conf)
+        if conf >= info["max"]:
+            info["max"] = float(conf)
+            info["dbg"] = dbg
+
+    for gray_proc, thr_main in sources:
+        if thr_main.size:
+            _record_candidate(thr_main)
+
+            if _looks_mostly_blank(thr_main):
+                thr_adapt = _adaptive_binarize(gray_proc, p)
+                _record_candidate(thr_adapt)
+
+        if gray_proc.size == 0:
+            continue
+
+        raw_thr = _binarize(gray_proc)
+        _record_candidate(raw_thr)
+
+        if p.morph_open != p.morph_close:
+            # Dans les cas où une seule opération morphologique est active,
+            # proposer aussi la variante complémentaire.
+            if p.morph_close:
+                open_variant = cv2.morphologyEx(
+                    raw_thr,
+                    cv2.MORPH_OPEN,
+                    np.ones((2, 2), np.uint8),
+                    iterations=1,
+                )
+                _record_candidate(open_variant)
+            if p.morph_open:
+                close_variant = cv2.morphologyEx(
+                    raw_thr,
+                    cv2.MORPH_CLOSE,
+                    np.ones((2, 2), np.uint8),
+                    iterations=1,
+                )
+                _record_candidate(close_variant)
 
     if not aggregated:
         return None, 0.0, fallback_dbg
@@ -384,9 +380,9 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
 def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = None) -> Tuple[Optional[str], float, np.ndarray]:
     """
     OCR Tesseract avec plusieurs variantes/fallbacks. Retourne (texte, confiance, image_debug).
-    Nouveautés :
-      - Ajout d’un essai PSM 13 (ligne brute) pour les chiffres serrés
-      - Légère hausse d’upscale (jusqu’à 140 px de haut) comme backup
+    Les combinaisons balayées privilégient les variations légères (PSM 7/8/6, upscale à 140 px,
+    et désactivation de la morphologie) pour limiter le temps de traitement tout en conservant
+    une bonne couverture des cas difficiles.
     """
     g = _make_gray(bgr_or_gray)
     p0 = params if params is not None else DEFAULT_PARAMS
@@ -395,21 +391,23 @@ def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = N
     threshold = 0.85  # si on dépasse, on “early return”
 
     # Essai principal
-    for p in (
+    combos = [
         p0,
-        replace(p0, psm=(7 if int(p0.psm) != 7 else 8)),             # alterner 7/8
-        replace(p0, psm=6),                                          # NEW: ligne standard
-        replace(p0, scale_to_height=max(110, int(p0.scale_to_height))),
-        replace(p0, psm=13),                                         # NEW: ligne brute
-        replace(p0, scale_to_height=max(140, int(p0.scale_to_height))),  # NEW: plus grand
-        replace(p0, morph_open=False, morph_close=False),            # NEW: sans morpho
-        replace(p0, clahe=False, unsharp=False),                     # NEW: moins de filtres
-    ):
+        replace(p0, psm=(7 if int(p0.psm) != 7 else 8)),
+        replace(p0, psm=6),
+        replace(p0, scale_to_height=max(140, int(p0.scale_to_height))),
+        replace(p0, morph_open=False, morph_close=False),
+    ]
+
+    for p in combos:
         t, c, dbg = _finalize_and_try(g, p)
         if c >= threshold and t is not None:
             return t, c, dbg
         if c > best[1]:
             best = (t, c, dbg)
+
+        if best[0] is not None and best[1] >= 0.75:
+            break
 
     # Retour meilleur trouvé
     t, c, dbg = best
