@@ -1088,9 +1088,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export", f"Impossible de préparer la source : {e}")
             return
 
+        total_precalc = int(precomp_reader.frame_count) if precomp_reader.frame_count > 0 else None
+        precalc_progress = QProgressDialog("Préparation du lissage…", "Annuler", 0, total_precalc or 0, self)
+        precalc_progress.setWindowModality(Qt.WindowModal)
+        precalc_progress.setMinimumDuration(0)
+
         mph_sequence: List[Optional[float]] = []
         precalc_error: Optional[Exception] = None
+        precalc_canceled = False
         try:
+            idx = 0
             while True:
                 ok_calc, frame_calc = precomp_reader.read()
                 if not ok_calc or frame_calc is None:
@@ -1103,13 +1110,31 @@ class MainWindow(QMainWindow):
                     precalc_error = e
                     break
                 mph_sequence.append(kmh_val * KMH_TO_MPH if kmh_val is not None else None)
+
+                if total_precalc:
+                    precalc_progress.setMaximum(total_precalc)
+                    precalc_progress.setValue(idx)
+                else:
+                    precalc_progress.setValue(idx % 100)
+                QApplication.processEvents()
+                if precalc_progress.wasCanceled():
+                    precalc_canceled = True
+                    break
+                idx += 1
+            if not precalc_canceled and precalc_error is None:
+                if total_precalc:
+                    precalc_progress.setMaximum(total_precalc)
+                    precalc_progress.setValue(total_precalc)
+                else:
+                    precalc_progress.setValue(0)
         finally:
+            precalc_progress.close()
             try:
                 precomp_reader.release()
             except Exception:
                 pass
 
-        if precalc_error is not None:
+        if precalc_error is not None or precalc_canceled:
             try:
                 new_reader.release()
             except Exception:
