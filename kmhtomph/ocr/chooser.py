@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Sequence
 
 import numpy as np
 
@@ -12,12 +12,12 @@ from ..constants import DEFAULT_ANTI_JITTER, AntiJitterConfig
 def _reset_memory(state: AntiJitterState) -> None:
     """Oublie la dernière valeur acceptée et vide la fenêtre médiane."""
     state.last_kmh = None
-    state.win = _MedianWindow(state.config.window_size)
+    state.win = _MedianWindow(state.config.median_past_frames)
 
 
 class _MedianWindow:
     def __init__(self, size: int):
-        self.size = int(size)
+        self.size = max(0, int(size))
         self.buf: List[float] = []
 
     def add(self, v: float) -> None:
@@ -39,20 +39,20 @@ class AntiJitterState:
     win: _MedianWindow = field(init=False)
 
     def __post_init__(self):
-        self.win = _MedianWindow(self.config.window_size)
+        self.win = _MedianWindow(self.config.median_past_frames)
 
 
 def reset(state: AntiJitterState) -> None:
     state.last_kmh = None
     state.miss_streak = 0
-    state.win = _MedianWindow(state.config.window_size)
+    state.win = _MedianWindow(state.config.median_past_frames)
 
 
 def update_config(state: AntiJitterState, config: AntiJitterConfig) -> None:
     """Met à jour la configuration de lissage tout en conservant l'état utile."""
     state.config = config
     last_value = state.last_kmh
-    state.win = _MedianWindow(config.window_size)
+    state.win = _MedianWindow(config.median_past_frames)
     if last_value is not None:
         state.win.add(float(last_value))
     state.miss_streak = min(state.miss_streak, int(config.hold_max_gap_frames))
@@ -64,6 +64,30 @@ def _score_candidate(value: float, conf: float, median_ref: Optional[float]) -> 
         return base
     bonus = max(0.0, 1.0 - (abs(float(value) - float(median_ref)) / 10.0))
     return base + 0.1 * bonus
+
+
+def centered_median_smoothing(
+    values: Sequence[Optional[float]],
+    past: int,
+    future: int,
+) -> List[Optional[float]]:
+    """Applique un filtre médian centré en tenant compte du passé et du futur."""
+
+    past = max(0, int(past))
+    future = max(0, int(future))
+    n = len(values)
+    smoothed: List[Optional[float]] = [None] * n
+
+    for idx in range(n):
+        start = max(0, idx - past)
+        end = min(n, idx + future + 1)
+        window = [v for v in values[start:end] if v is not None]
+        if not window:
+            smoothed[idx] = None
+        else:
+            smoothed[idx] = float(np.median(window))
+
+    return smoothed
 
 
 def choose_best_kmh(
