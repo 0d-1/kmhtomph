@@ -6,6 +6,7 @@ barre de progression + raccourcis, extraction ROI par homographie exacte.
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 from typing import Optional, List
 
 import copy
@@ -18,7 +19,8 @@ from PyQt5.QtCore import Qt, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QAction, QFileDialog, QMessageBox, QApplication,
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox,
-    QProgressDialog, QSlider, QGroupBox, QFormLayout, QDoubleSpinBox, QSizePolicy
+    QProgressDialog, QSlider, QGroupBox, QFormLayout, QDoubleSpinBox, QSizePolicy,
+    QProgressBar,
 )
 from PyQt5.QtGui import QImage, QPixmap
 
@@ -110,6 +112,8 @@ class MainWindow(QMainWindow):
         if stored_path:
             self._tesseract_path = stored_path
         self._apply_tesseract_path(initial=True)
+
+        self._status_tasks: dict[str, dict] = {}
 
         # --- UI ---
         self.canvas = VideoCanvas(self)
@@ -310,6 +314,18 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(range_group)
 
+        status_group = QGroupBox("Statut", panel)
+        status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(9, 9, 9, 9)
+        status_layout.setSpacing(6)
+
+        self.status_empty_label = QLabel("Aucune tâche en cours", status_group)
+        self.status_empty_label.setStyleSheet("color: #888; font-style: italic;")
+        status_layout.addWidget(self.status_empty_label)
+
+        self._status_layout = status_layout
+        layout.addWidget(status_group)
+
         layout.addStretch(1)
 
         self.debug_label_title = QLabel("Vignette debug", panel)
@@ -324,6 +340,120 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.debug_preview, 0, Qt.AlignBottom)
 
         return panel
+
+    def _status_begin_task(self, task_id: str, title: str, total: Optional[int]) -> None:
+        if not getattr(self, "_status_layout", None):
+            return
+        if task_id in self._status_tasks:
+            self._status_finish_task(task_id, immediate=True)
+
+        container = QWidget(self)
+        box_layout = QVBoxLayout(container)
+        box_layout.setContentsMargins(0, 0, 0, 0)
+        box_layout.setSpacing(4)
+
+        title_label = QLabel(title, container)
+        title_label.setStyleSheet("font-weight: bold;")
+        box_layout.addWidget(title_label)
+
+        progress = QProgressBar(container)
+        progress.setMinimum(0)
+        total_value = int(total) if total is not None and total > 0 else None
+        if total_value:
+            progress.setMaximum(total_value)
+        else:
+            progress.setRange(0, 0)
+        box_layout.addWidget(progress)
+
+        eta_label = QLabel("Temps restant estimé : calcul…", container)
+        eta_label.setStyleSheet("color: #888; font-size: 11px;")
+        box_layout.addWidget(eta_label)
+
+        self._status_layout.addWidget(container)
+        if getattr(self, "status_empty_label", None) is not None:
+            self.status_empty_label.hide()
+
+        self._status_tasks[task_id] = {
+            "widget": container,
+            "progress": progress,
+            "eta": eta_label,
+            "start": time.monotonic(),
+            "total": total_value,
+            "title": title,
+        }
+
+    def _status_update_task(self, task_id: str, value: int, total: Optional[int] = None) -> None:
+        info = self._status_tasks.get(task_id)
+        if not info:
+            return
+
+        progress: QProgressBar = info["progress"]
+        if total is not None:
+            total_value = int(total) if total and total > 0 else None
+            info["total"] = total_value
+            if total_value:
+                progress.setRange(0, total_value)
+            else:
+                progress.setRange(0, 0)
+
+        total_frames = info.get("total")
+        if total_frames:
+            clamped = max(0, min(int(value), total_frames))
+            progress.setValue(clamped)
+            if clamped > 0:
+                elapsed = max(0.0, time.monotonic() - info["start"])
+                rate = elapsed / clamped if clamped else None
+                if rate and np.isfinite(rate):
+                    remaining = max(0.0, (total_frames - clamped) * rate)
+                    eta_txt = self._format_hms(remaining)
+                    info["eta"].setStyleSheet("color: #888; font-size: 11px;")
+                    info["eta"].setText(f"Temps restant estimé : {eta_txt}")
+                else:
+                    info["eta"].setText("Temps restant estimé : calcul…")
+            else:
+                info["eta"].setText("Temps restant estimé : calcul…")
+        else:
+            # Indeterminate task
+            progress.setRange(0, 0)
+            info["eta"].setStyleSheet("color: #888; font-size: 11px;")
+            info["eta"].setText("Temps restant estimé : indéterminé")
+
+    def _status_finish_task(
+        self,
+        task_id: str,
+        *,
+        message: Optional[str] = None,
+        success: bool = True,
+        immediate: bool = False,
+    ) -> None:
+        info = self._status_tasks.get(task_id)
+        if not info:
+            return
+
+        progress: QProgressBar = info["progress"]
+        if progress.maximum() == 0:
+            progress.setRange(0, 1)
+        progress.setValue(progress.maximum())
+
+        if message is None:
+            message = "Terminé" if success else "Interrompu"
+
+        color = "#2e7d32" if success else "#c62828"
+        info["eta"].setStyleSheet(f"color: {color}; font-size: 11px;")
+        info["eta"].setText(message)
+
+        def cleanup():
+            widget = info["widget"]
+            widget.setParent(None)
+            widget.deleteLater()
+            self._status_tasks.pop(task_id, None)
+            if not self._status_tasks and getattr(self, "status_empty_label", None) is not None:
+                self.status_empty_label.show()
+
+        if immediate:
+            cleanup()
+        else:
+            QTimer.singleShot(2000, cleanup)
 
     def _collect_smoothing_config(self) -> AntiJitterConfig:
         return AntiJitterConfig(
@@ -1092,6 +1222,8 @@ class MainWindow(QMainWindow):
         precalc_progress = QProgressDialog("Préparation du lissage…", "Annuler", 0, total_precalc or 0, self)
         precalc_progress.setWindowModality(Qt.WindowModal)
         precalc_progress.setMinimumDuration(0)
+        precalc_task_id = "precalc"
+        self._status_begin_task(precalc_task_id, "Préparation du lissage…", total_precalc)
 
         mph_sequence: List[Optional[float]] = []
         precalc_error: Optional[Exception] = None
@@ -1114,8 +1246,10 @@ class MainWindow(QMainWindow):
                 if total_precalc:
                     precalc_progress.setMaximum(total_precalc)
                     precalc_progress.setValue(idx)
+                    self._status_update_task(precalc_task_id, idx, total_precalc)
                 else:
                     precalc_progress.setValue(idx % 100)
+                    self._status_update_task(precalc_task_id, idx)
                 QApplication.processEvents()
                 if precalc_progress.wasCanceled():
                     precalc_canceled = True
@@ -1125,14 +1259,26 @@ class MainWindow(QMainWindow):
                 if total_precalc:
                     precalc_progress.setMaximum(total_precalc)
                     precalc_progress.setValue(total_precalc)
+                    self._status_update_task(precalc_task_id, total_precalc, total_precalc)
                 else:
                     precalc_progress.setValue(0)
+                    self._status_update_task(precalc_task_id, idx)
         finally:
             precalc_progress.close()
             try:
                 precomp_reader.release()
             except Exception:
                 pass
+            if precalc_canceled:
+                self._status_finish_task(precalc_task_id, message="Préparation annulée", success=False)
+            elif precalc_error is not None:
+                self._status_finish_task(
+                    precalc_task_id,
+                    message=f"Erreur de préparation : {precalc_error}",
+                    success=False,
+                )
+            else:
+                self._status_finish_task(precalc_task_id, message="Préparation terminée")
 
         if precalc_error is not None or precalc_canceled:
             try:
@@ -1210,15 +1356,20 @@ class MainWindow(QMainWindow):
         progress = QProgressDialog("Export en cours…", "Annuler", 0, total or 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        export_task_id = "export"
+        self._status_begin_task(export_task_id, "Export vidéo", total)
 
         canceled = {"flag": False}
+        export_error: Optional[Exception] = None
 
         def on_progress(done: int, total_opt: Optional[int]):
             if total_opt:
                 progress.setMaximum(total_opt)
                 progress.setValue(done)
+                self._status_update_task(export_task_id, done, total_opt)
             else:
                 progress.setValue(done % 100)
+                self._status_update_task(export_task_id, done)
             QApplication.processEvents()
             if progress.wasCanceled():
                 canceled["flag"] = True
@@ -1234,15 +1385,23 @@ class MainWindow(QMainWindow):
                 params=ExportParams(),
             )
             progress.setValue(progress.maximum())
+            if total:
+                self._status_update_task(export_task_id, total, total)
             QMessageBox.information(self, "Export", f"Fichier écrit :\n{out_path}")
+            self._status_finish_task(export_task_id, message="Export terminé")
         except Exception as e:
             if not canceled["flag"]:
+                export_error = e
                 QMessageBox.warning(self, "Export", f"Échec : {e}")
         finally:
             try:
                 new_reader.release()
             except Exception:
                 pass
+            if canceled["flag"]:
+                self._status_finish_task(export_task_id, message="Export annulé", success=False)
+            elif export_error is not None:
+                self._status_finish_task(export_task_id, message="Échec de l'export", success=False)
 
     # ------------- Seek / Slider -------------
 
