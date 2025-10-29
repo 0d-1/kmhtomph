@@ -1293,7 +1293,11 @@ class MainWindow(QMainWindow):
             cfg.median_past_frames,
             cfg.median_future_frames,
         )
-        smoothed_texts = [format_speed_text(v) if v is not None else None for v in smoothed_mph]
+        export_speed_decimals = 1
+        smoothed_texts = [
+            format_speed_text(v, decimals=export_speed_decimals) if v is not None else None
+            for v in smoothed_mph
+        ]
 
         fps_for_range = float(new_reader.fps or self._fps())
         known_total_frames = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
@@ -1331,7 +1335,7 @@ class MainWindow(QMainWindow):
             last_mph_value["value"] = mph_val
             text = smoothed_texts[idx] if idx < len(smoothed_texts) else None
             if text is None:
-                text = format_speed_text(mph_val)
+                text = format_speed_text(mph_val, decimals=export_speed_decimals)
             last_text_value["text"] = text
             return text
 
