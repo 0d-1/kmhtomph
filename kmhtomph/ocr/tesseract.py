@@ -278,27 +278,67 @@ def _tess_config(p: TesseractParams) -> str:
 
 
 def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    gray_proc, thr_main = _prep_for_ocr(gray_in, p)
+    gray_proc_full, thr_main_full = _prep_for_ocr(gray_in, p)
 
-    bounds = _content_bounds(thr_main)
+    bounds = _content_bounds(thr_main_full)
+    sources: List[Tuple[np.ndarray, np.ndarray]] = [(gray_proc_full, thr_main_full)]
+
     if bounds:
-        gray_proc = _crop_to_bounds(gray_proc, bounds)
-        thr_main = _crop_to_bounds(thr_main, bounds)
+        sources.append(
+            (
+                _crop_to_bounds(gray_proc_full, bounds),
+                _crop_to_bounds(thr_main_full, bounds),
+            )
+        )
 
-    base_variants: List[np.ndarray] = [thr_main]
+    base_variants: List[np.ndarray] = []
 
-    if _looks_mostly_blank(thr_main):
-        thr_adapt = _adaptive_binarize(gray_proc, p)
-        if bounds and thr_adapt.shape != thr_main.shape:
-            thr_adapt = _crop_to_bounds(thr_adapt, bounds)
-        base_variants.append(thr_adapt)
+    for gray_proc, thr_main in sources:
+        if thr_main.size:
+            base_variants.append(thr_main)
 
-    fallback_dbg = cv2.cvtColor(gray_proc if gray_proc.size else gray_in, cv2.COLOR_GRAY2BGR)
+            if _looks_mostly_blank(thr_main):
+                thr_adapt = _adaptive_binarize(gray_proc, p)
+                base_variants.append(thr_adapt)
+
+        if gray_proc.size == 0:
+            continue
+
+        raw_thr = _binarize(gray_proc)
+        base_variants.append(raw_thr)
+
+        inv_thr = cv2.threshold(gray_proc, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        base_variants.append(inv_thr)
+
+        if p.morph_close:
+            close_variant = cv2.morphologyEx(
+                raw_thr,
+                cv2.MORPH_CLOSE,
+                np.ones((2, 2), np.uint8),
+                iterations=1,
+            )
+            base_variants.append(close_variant)
+
+        if p.morph_open:
+            open_variant = cv2.morphologyEx(
+                raw_thr,
+                cv2.MORPH_OPEN,
+                np.ones((2, 2), np.uint8),
+                iterations=1,
+            )
+            base_variants.append(open_variant)
+
+    fallback_dbg = cv2.cvtColor(
+        gray_proc_full if gray_proc_full.size else gray_in,
+        cv2.COLOR_GRAY2BGR,
+    )
 
     aggregated: Dict[str, Dict[str, Any]] = {}
     seen: Set[bytes] = set()
 
     for variant in base_variants:
+        if variant is None or variant.size == 0:
+            continue
         for candidate in (variant, cv2.bitwise_not(variant)):
             prepared, _ = _prepare_for_tesseract(candidate)
             sig = prepared.tobytes()
@@ -358,9 +398,12 @@ def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = N
     for p in (
         p0,
         replace(p0, psm=(7 if int(p0.psm) != 7 else 8)),             # alterner 7/8
+        replace(p0, psm=6),                                          # NEW: ligne standard
         replace(p0, scale_to_height=max(110, int(p0.scale_to_height))),
         replace(p0, psm=13),                                         # NEW: ligne brute
         replace(p0, scale_to_height=max(140, int(p0.scale_to_height))),  # NEW: plus grand
+        replace(p0, morph_open=False, morph_close=False),            # NEW: sans morpho
+        replace(p0, clahe=False, unsharp=False),                     # NEW: moins de filtres
     ):
         t, c, dbg = _finalize_and_try(g, p)
         if c >= threshold and t is not None:
