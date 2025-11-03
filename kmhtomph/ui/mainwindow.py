@@ -5,7 +5,7 @@ barre de progression + raccourcis, extraction ROI par homographie exacte.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
 from typing import Optional, List
 
@@ -20,9 +20,9 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QAction, QFileDialog, QMessageBox, QApplication,
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox,
     QProgressDialog, QSlider, QGroupBox, QFormLayout, QDoubleSpinBox, QSizePolicy,
-    QProgressBar,
+    QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QColor
 
 from pytesseract import TesseractNotFoundError
 
@@ -33,7 +33,6 @@ from ..constants import (
     AntiJitterConfig,
 )
 from ..ocr import OCRPipeline
-from ..ocr.chooser import centered_median_smoothing
 from ..ocr.tesseract import auto_locate_tesseract
 from ..video.io import VideoReader
 from ..video.exporter import export_video, ExportParams
@@ -66,6 +65,18 @@ def _extract_roi_from_corners(
         borderMode=cv2.BORDER_REPLICATE,
     )
     return patch
+
+
+@dataclass
+class SpeedTimelineEntry:
+    time_sec: float
+    kmh: Optional[float]
+    manual: bool = False
+
+    def mph(self) -> Optional[float]:
+        if self.kmh is None:
+            return None
+        return float(self.kmh) * KMH_TO_MPH
 
 
 class MainWindow(QMainWindow):
@@ -115,8 +126,17 @@ class MainWindow(QMainWindow):
 
         self._status_tasks: dict[str, dict] = {}
 
+        # --- timeline ---
+        self.timeline_step_seconds: float = 0.5
+        self.speed_timeline: List[SpeedTimelineEntry] = []
+        self._timeline_context: Optional[dict] = None
+        self._timeline_total_duration: float = 0.0
+        self._timeline_status_reason: Optional[str] = "Aucune analyse effectuée."
+        self._timeline_table_loading: bool = False
+
         # --- UI ---
         self.canvas = VideoCanvas(self)
+        self.canvas.on_roi_changed.connect(self._on_canvas_roi_changed)
 
         self._loading_overlay_settings = True
         self.overlay_style = self._load_overlay_style(self.overlay_style)
@@ -224,6 +244,8 @@ class MainWindow(QMainWindow):
 
         self.resize(1000, 740)
 
+        self._refresh_timeline_table()
+
     # ------------- Menu -------------
 
     def _create_side_panel(self) -> QWidget:
@@ -314,6 +336,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(range_group)
 
+        timeline_group = self._create_timeline_group(panel)
+        layout.addWidget(timeline_group)
+
         status_group = QGroupBox("Statut", panel)
         status_layout = QVBoxLayout(status_group)
         status_layout.setContentsMargins(9, 9, 9, 9)
@@ -340,6 +365,420 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.debug_preview, 0, Qt.AlignBottom)
 
         return panel
+
+    def _create_timeline_group(self, parent: QWidget) -> QGroupBox:
+        group = QGroupBox("Analyse des vitesses", parent)
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(9, 9, 9, 9)
+        group_layout.setSpacing(6)
+
+        self.btn_analyze_timeline = QPushButton("Analyser les vitesses", group)
+        self.btn_analyze_timeline.clicked.connect(self._on_analyze_timeline)
+        group_layout.addWidget(self.btn_analyze_timeline)
+
+        self.timeline_status_label = QLabel(self._timeline_status_reason or "", group)
+        self.timeline_status_label.setWordWrap(True)
+        self.timeline_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        group_layout.addWidget(self.timeline_status_label)
+
+        self.timeline_table = QTableWidget(group)
+        self.timeline_table.setColumnCount(3)
+        self.timeline_table.setHorizontalHeaderLabels(["Temps (s)", "km/h", "mph"])
+        header = self.timeline_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.timeline_table.verticalHeader().setVisible(False)
+        self.timeline_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.timeline_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.timeline_table.setAlternatingRowColors(True)
+        self.timeline_table.setEditTriggers(
+            QTableWidget.DoubleClicked | QTableWidget.SelectedClicked | QTableWidget.EditKeyPressed
+        )
+        self.timeline_table.itemChanged.connect(self._on_timeline_item_changed)
+        group_layout.addWidget(self.timeline_table, 1)
+
+        return group
+
+    def _refresh_timeline_table(self) -> None:
+        if not hasattr(self, "timeline_table"):
+            return
+        self._timeline_table_loading = True
+        try:
+            self.timeline_table.clearContents()
+            row_count = len(self.speed_timeline)
+            self.timeline_table.setRowCount(row_count)
+            if row_count > 0:
+                default_color = self.timeline_table.palette().color(self.timeline_table.backgroundRole())
+                for row, entry in enumerate(self.speed_timeline):
+                    time_item = QTableWidgetItem(f"{entry.time_sec:.2f}")
+                    time_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    time_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.timeline_table.setItem(row, 0, time_item)
+
+                    kmh_text = "" if entry.kmh is None else f"{entry.kmh:.1f}"
+                    kmh_item = QTableWidgetItem(kmh_text)
+                    kmh_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.timeline_table.setItem(row, 1, kmh_item)
+
+                    mph_val = entry.mph()
+                    mph_text = "" if mph_val is None else f"{mph_val:.1f}"
+                    mph_item = QTableWidgetItem(mph_text)
+                    mph_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    mph_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.timeline_table.setItem(row, 2, mph_item)
+
+                    self._apply_timeline_row_style(row, entry.manual, default_color)
+        finally:
+            self._timeline_table_loading = False
+
+        self._refresh_timeline_status_label()
+
+    def _refresh_timeline_status_label(self) -> None:
+        if not hasattr(self, "timeline_status_label"):
+            return
+        if not self.speed_timeline:
+            message = self._timeline_status_reason or "Aucune analyse effectuée."
+            self.timeline_status_label.setStyleSheet("color: #888; font-size: 11px;")
+            self.timeline_status_label.setText(message)
+            return
+
+        manual_count = sum(1 for entry in self.speed_timeline if entry.manual)
+        base = f"{len(self.speed_timeline)} valeurs analysées (pas {self.timeline_step_seconds:.1f} s)."
+        if self._timeline_total_duration > 0.0:
+            base += f" Durée couverte : {self._format_hms(self._timeline_total_duration)}."
+        if manual_count:
+            base += f" {manual_count} valeur(s) modifiée(s) manuellement."
+        self.timeline_status_label.setStyleSheet("color: #555; font-size: 11px;")
+        self.timeline_status_label.setText(base)
+
+    def _apply_timeline_row_style(
+        self,
+        row: int,
+        manual: bool,
+        default_color: Optional[QColor] = None,
+    ) -> None:
+        if not hasattr(self, "timeline_table"):
+            return
+        if default_color is None:
+            default_color = self.timeline_table.palette().color(self.timeline_table.backgroundRole())
+        color = QColor("#FFF4D6") if manual else default_color
+        for col in range(self.timeline_table.columnCount()):
+            item = self.timeline_table.item(row, col)
+            if item is not None:
+                item.setBackground(color)
+
+    def _update_timeline_row(self, row: int) -> None:
+        if not hasattr(self, "timeline_table"):
+            return
+        if row < 0 or row >= len(self.speed_timeline):
+            return
+        entry = self.speed_timeline[row]
+        default_color = self.timeline_table.palette().color(self.timeline_table.backgroundRole())
+        self._timeline_table_loading = True
+        try:
+            kmh_item = self.timeline_table.item(row, 1)
+            if kmh_item is None:
+                kmh_item = QTableWidgetItem()
+                self.timeline_table.setItem(row, 1, kmh_item)
+            kmh_item.setText("" if entry.kmh is None else f"{entry.kmh:.1f}")
+            kmh_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            mph_item = self.timeline_table.item(row, 2)
+            if mph_item is None:
+                mph_item = QTableWidgetItem()
+                mph_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                self.timeline_table.setItem(row, 2, mph_item)
+            mph_val = entry.mph()
+            mph_item.setText("" if mph_val is None else f"{mph_val:.1f}")
+            mph_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        finally:
+            self._timeline_table_loading = False
+
+        self._apply_timeline_row_style(row, entry.manual, default_color)
+        self._refresh_timeline_status_label()
+
+    def _has_manual_timeline_edits(self) -> bool:
+        return any(entry.manual for entry in self.speed_timeline)
+
+    def _on_timeline_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._timeline_table_loading:
+            return
+        if item.column() != 1:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self.speed_timeline):
+            return
+
+        text = item.text().strip()
+        if text:
+            text = text.replace(",", ".")
+        entry = self.speed_timeline[row]
+        if not text:
+            entry.kmh = None
+            entry.manual = True
+            self._update_timeline_row(row)
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            self._timeline_table_loading = True
+            try:
+                item.setText("" if entry.kmh is None else f"{entry.kmh:.1f}")
+            finally:
+                self._timeline_table_loading = False
+            return
+
+        entry.kmh = value
+        entry.manual = True
+        self._timeline_status_reason = None
+        self._update_timeline_row(row)
+
+    def _on_analyze_timeline(self) -> None:
+        if not self.reader or not self.reader.is_opened():
+            QMessageBox.information(self, "Analyse", "Ouvrez d’abord une vidéo avant de lancer l’analyse.")
+            return
+        if self._has_manual_timeline_edits():
+            answer = QMessageBox.question(
+                self,
+                "Analyse",
+                "L’analyse va écraser les modifications manuelles existantes. Continuer ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self._perform_speed_analysis()
+
+    def _perform_speed_analysis(self) -> bool:
+        if not self.reader or not self.reader.is_opened():
+            QMessageBox.information(self, "Analyse", "Ouvrez d’abord une vidéo avant de lancer l’analyse.")
+            return False
+
+        src = self.reader.source
+        if not src:
+            QMessageBox.warning(self, "Analyse", "Impossible de déterminer la source vidéo.")
+            return False
+
+        cx, cy, w, h, _ = self.canvas.get_roi()
+        if w <= 1 or h <= 1:
+            QMessageBox.warning(self, "Analyse", "La zone de lecture (ROI) est trop petite.")
+            return False
+        base_corners = self.canvas.get_roi_corners().copy()
+
+        precalc_ocr = copy.deepcopy(self.ocr)
+        precalc_ocr.reset()
+
+        analysis_reader = VideoReader(src)
+        try:
+            analysis_reader.open()
+        except Exception as e:
+            QMessageBox.critical(self, "Analyse", f"Impossible de préparer la vidéo : {e}")
+            return False
+
+        fps_source = float(analysis_reader.fps or self._fps())
+        total_precalc = int(analysis_reader.frame_count) if analysis_reader.frame_count > 0 else None
+        progress = QProgressDialog("Analyse des vitesses…", "Annuler", 0, total_precalc or 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        analysis_task_id = "timeline-analysis"
+        self._status_begin_task(analysis_task_id, "Analyse des vitesses", total_precalc)
+
+        mph_sequence: List[Optional[float]] = []
+        error: Optional[Exception] = None
+        canceled = False
+        idx = 0
+        try:
+            while True:
+                ok_calc, frame_calc = analysis_reader.read()
+                if not ok_calc or frame_calc is None:
+                    break
+                roi_calc = _extract_roi_from_corners(frame_calc, base_corners, w, h)
+                try:
+                    kmh_val, _, _, _ = precalc_ocr.read_kmh(roi_calc, mode=self.ocr_mode)
+                except (TesseractNotFoundError, FileNotFoundError) as e:
+                    self._handle_tesseract_error(e)
+                    error = e
+                    break
+                mph_sequence.append(kmh_val * KMH_TO_MPH if kmh_val is not None else None)
+
+                if total_precalc:
+                    progress.setMaximum(total_precalc)
+                    progress.setValue(idx)
+                    self._status_update_task(analysis_task_id, idx, total_precalc)
+                else:
+                    progress.setValue(idx % 100)
+                    self._status_update_task(analysis_task_id, idx)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+                idx += 1
+
+            if not canceled and error is None and total_precalc:
+                progress.setMaximum(total_precalc)
+                progress.setValue(total_precalc)
+                self._status_update_task(analysis_task_id, total_precalc, total_precalc)
+        finally:
+            progress.close()
+            try:
+                analysis_reader.release()
+            except Exception:
+                pass
+            if canceled:
+                self._status_finish_task(analysis_task_id, message="Analyse annulée", success=False)
+            elif error is not None:
+                self._status_finish_task(
+                    analysis_task_id,
+                    message=f"Erreur : {error}",
+                    success=False,
+                )
+            else:
+                self._status_finish_task(analysis_task_id, message="Analyse terminée")
+
+        if canceled:
+            self._timeline_status_reason = "Analyse annulée."
+            self._refresh_timeline_table()
+            return False
+        if error is not None:
+            if not isinstance(error, (TesseractNotFoundError, FileNotFoundError)):
+                QMessageBox.warning(self, "Analyse", f"Échec de l’analyse : {error}")
+            return False
+
+        if not mph_sequence:
+            self.speed_timeline = []
+            self._timeline_total_duration = 0.0
+            self._timeline_context = self._current_timeline_context()
+            self._timeline_status_reason = "Aucune donnée détectée."
+            self._refresh_timeline_table()
+            return True
+
+        timeline_entries = self._build_timeline_from_sequence(mph_sequence, fps_source)
+        self.speed_timeline = timeline_entries
+        self._timeline_context = self._current_timeline_context()
+        self._timeline_total_duration = (len(mph_sequence) / fps_source) if fps_source > 0 else 0.0
+        self._timeline_status_reason = None
+        self._refresh_timeline_table()
+        return True
+
+    def _build_timeline_from_sequence(
+        self,
+        mph_sequence: List[Optional[float]],
+        fps: float,
+    ) -> List[SpeedTimelineEntry]:
+        fps = float(fps) if fps and fps > 0 else float(self._fps())
+        if fps <= 0:
+            fps = 25.0
+        total_frames = len(mph_sequence)
+        if total_frames <= 0:
+            return []
+        total_seconds = total_frames / fps
+        steps = int(math.ceil(total_seconds / self.timeline_step_seconds))
+        entries: List[SpeedTimelineEntry] = []
+        for step_idx in range(steps):
+            start_time = step_idx * self.timeline_step_seconds
+            end_time = min(total_seconds, start_time + self.timeline_step_seconds)
+            start_frame = int(math.floor(start_time * fps + 1e-6))
+            end_frame = int(math.floor(end_time * fps + 1e-6))
+            if end_frame <= start_frame:
+                end_frame = min(start_frame + 1, total_frames)
+            segment = mph_sequence[start_frame:end_frame]
+            valid = [float(v) for v in segment if v is not None and np.isfinite(v)]
+            if valid:
+                mph_val = float(np.median(valid))
+                kmh_val: Optional[float] = mph_val / KMH_TO_MPH
+            else:
+                kmh_val = None
+            entries.append(
+                SpeedTimelineEntry(
+                    time_sec=float(round(start_time, 3)),
+                    kmh=kmh_val,
+                    manual=False,
+                )
+            )
+        return entries
+
+    def _invalidate_speed_timeline(self, reason: Optional[str] = None) -> None:
+        had_timeline = bool(self.speed_timeline)
+        self.speed_timeline = []
+        self._timeline_context = None
+        self._timeline_total_duration = 0.0
+        if reason and had_timeline:
+            self._timeline_status_reason = f"Recalcul requis ({reason})."
+        elif not had_timeline and self._timeline_status_reason is None:
+            self._timeline_status_reason = "Aucune analyse effectuée."
+        elif not reason:
+            self._timeline_status_reason = "Aucune analyse effectuée."
+        self._refresh_timeline_table()
+
+    def _on_canvas_roi_changed(self) -> None:
+        if self.speed_timeline:
+            self._invalidate_speed_timeline("ROI modifié")
+
+    def _current_timeline_context(self) -> Optional[dict]:
+        if not self.reader or not self.reader.is_opened():
+            return None
+        cx, cy, w, h, ang = self.canvas.get_roi()
+        corners = tuple(round(float(v), 3) for v in self.canvas.get_roi_corners().flatten())
+        cfg = self.ocr.anti_jitter
+        return {
+            "source": self.reader.source,
+            "mode": self.ocr_mode,
+            "roi": (int(cx), int(cy), int(w), int(h), round(float(ang), 3), corners),
+            "smoothing": (
+                int(cfg.median_past_frames),
+                int(cfg.median_future_frames),
+                float(cfg.max_delta_kmh),
+                float(cfg.min_confidence),
+                int(cfg.hold_max_gap_frames),
+            ),
+        }
+
+    def _timeline_mph_for_frame(self, frame_idx: int, fps: float) -> Optional[float]:
+        if not self.speed_timeline:
+            return None
+        if fps <= 0:
+            fps = self._fps()
+        fps = max(float(fps), 1e-6)
+        time_sec = float(frame_idx) / fps
+        if self.timeline_step_seconds <= 0:
+            row = 0
+        else:
+            row = int(time_sec / self.timeline_step_seconds)
+        row = max(0, min(row, len(self.speed_timeline) - 1))
+        return self.speed_timeline[row].mph()
+
+    def _ensure_speed_timeline_ready_for_export(self) -> bool:
+        if not self.reader or not self.reader.is_opened():
+            return False
+
+        if not self.speed_timeline:
+            answer = QMessageBox.question(
+                self,
+                "Export",
+                "Aucune analyse des vitesses n’a été réalisée. Voulez-vous la lancer maintenant ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+            if not self._perform_speed_analysis():
+                return False
+
+        ctx = self._current_timeline_context()
+        if self._timeline_context is None or ctx != self._timeline_context:
+            answer = QMessageBox.question(
+                self,
+                "Export",
+                "Les paramètres ont changé depuis la dernière analyse. Relancer l’analyse maintenant ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+            if not self._perform_speed_analysis():
+                return False
+        return bool(self.speed_timeline)
 
     def _status_begin_task(self, task_id: str, title: str, total: Optional[int]) -> None:
         if not getattr(self, "_status_layout", None):
@@ -534,6 +973,8 @@ class MainWindow(QMainWindow):
         config = self._collect_smoothing_config()
         self.ocr.set_anti_jitter_config(config)
         self._save_smoothing_settings(config)
+        if self.speed_timeline:
+            self._invalidate_speed_timeline("Paramètres de lissage modifiés")
 
     def _save_range_settings(self) -> None:
         self._settings.setValue("range/enabled", bool(self.transcription_range_enabled))
@@ -1002,6 +1443,7 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, txt: str):
         self.ocr_mode = txt
         self.ocr.reset()
+        self._invalidate_speed_timeline("Mode OCR modifié")
 
     def _on_toggle_debug(self, state: int):
         self.show_debug_thumb = (state == Qt.Checked)
@@ -1051,6 +1493,7 @@ class MainWindow(QMainWindow):
         self._set_overlay_text(None, allow_placeholder=True)
         self.ocr.reset()
         self._set_debug_thumbnail(None)
+        self._invalidate_speed_timeline("Nouvelle vidéo")
         self._refresh_overlay_for_range()
 
     def _on_toggle_play(self):
@@ -1190,6 +1633,9 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
+        if not self._ensure_speed_timeline_ready_for_export():
+            return
+
         src = self.reader.source
         new_reader = VideoReader(src)
         try:
@@ -1198,106 +1644,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export", f"Impossible de rouvrir la source : {e}")
             return
 
-        # Capturer le ROI & coins actuels
-        cx, cy, w, h, ang = self.canvas.get_roi()
-        base_corners = self.canvas.get_roi_corners().copy()
         style = self.overlay_style
         out_cx, out_cy, out_w, out_h, out_ang = self.canvas.get_overlay_rect()
-
-        precalc_ocr = copy.deepcopy(self.ocr)
-        precalc_ocr.reset()
-
-        precomp_reader = VideoReader(src)
-        try:
-            precomp_reader.open()
-        except Exception as e:
-            try:
-                new_reader.release()
-            except Exception:
-                pass
-            QMessageBox.critical(self, "Export", f"Impossible de préparer la source : {e}")
-            return
-
-        total_precalc = int(precomp_reader.frame_count) if precomp_reader.frame_count > 0 else None
-        precalc_progress = QProgressDialog("Préparation du lissage…", "Annuler", 0, total_precalc or 0, self)
-        precalc_progress.setWindowModality(Qt.WindowModal)
-        precalc_progress.setMinimumDuration(0)
-        precalc_task_id = "precalc"
-        self._status_begin_task(precalc_task_id, "Préparation du lissage…", total_precalc)
-
-        mph_sequence: List[Optional[float]] = []
-        precalc_error: Optional[Exception] = None
-        precalc_canceled = False
-        try:
-            idx = 0
-            while True:
-                ok_calc, frame_calc = precomp_reader.read()
-                if not ok_calc or frame_calc is None:
-                    break
-                roi_calc = _extract_roi_from_corners(frame_calc, base_corners, w, h)
-                try:
-                    kmh_val, _, _, _ = precalc_ocr.read_kmh(roi_calc, mode=self.ocr_mode)
-                except (TesseractNotFoundError, FileNotFoundError) as e:
-                    self._handle_tesseract_error(e)
-                    precalc_error = e
-                    break
-                mph_sequence.append(kmh_val * KMH_TO_MPH if kmh_val is not None else None)
-
-                if total_precalc:
-                    precalc_progress.setMaximum(total_precalc)
-                    precalc_progress.setValue(idx)
-                    self._status_update_task(precalc_task_id, idx, total_precalc)
-                else:
-                    precalc_progress.setValue(idx % 100)
-                    self._status_update_task(precalc_task_id, idx)
-                QApplication.processEvents()
-                if precalc_progress.wasCanceled():
-                    precalc_canceled = True
-                    break
-                idx += 1
-            if not precalc_canceled and precalc_error is None:
-                if total_precalc:
-                    precalc_progress.setMaximum(total_precalc)
-                    precalc_progress.setValue(total_precalc)
-                    self._status_update_task(precalc_task_id, total_precalc, total_precalc)
-                else:
-                    precalc_progress.setValue(0)
-                    self._status_update_task(precalc_task_id, idx)
-        finally:
-            precalc_progress.close()
-            try:
-                precomp_reader.release()
-            except Exception:
-                pass
-            if precalc_canceled:
-                self._status_finish_task(precalc_task_id, message="Préparation annulée", success=False)
-            elif precalc_error is not None:
-                self._status_finish_task(
-                    precalc_task_id,
-                    message=f"Erreur de préparation : {precalc_error}",
-                    success=False,
-                )
-            else:
-                self._status_finish_task(precalc_task_id, message="Préparation terminée")
-
-        if precalc_error is not None or precalc_canceled:
-            try:
-                new_reader.release()
-            except Exception:
-                pass
-            return
-
-        cfg = precalc_ocr.anti_jitter
-        smoothed_mph = centered_median_smoothing(
-            mph_sequence,
-            cfg.median_past_frames,
-            cfg.median_future_frames,
-        )
-        export_speed_decimals = 1
-        smoothed_texts = [
-            format_speed_text(v, decimals=export_speed_decimals) if v is not None else None
-            for v in smoothed_mph
-        ]
 
         fps_for_range = float(new_reader.fps or self._fps())
         known_total_frames = int(new_reader.frame_count) if new_reader.frame_count > 0 else None
@@ -1319,23 +1667,20 @@ class MainWindow(QMainWindow):
             last_mph_value["value"] = None
             last_text_value["text"] = None
 
+        export_speed_decimals = 1
+
         def text_supplier(idx: int, frame_bgr: np.ndarray) -> Optional[str]:
             if range_enabled and (idx < start_frame or idx > end_frame):
                 _reset_last_values()
                 return None
-            if idx < len(smoothed_mph):
-                mph_val = smoothed_mph[idx]
-            else:
-                mph_val = None
+            mph_val = self._timeline_mph_for_frame(idx, fps_for_range)
             if mph_val is None:
                 cached_text = last_text_value["text"]
                 if cached_text:
                     return cached_text
                 return None
             last_mph_value["value"] = mph_val
-            text = smoothed_texts[idx] if idx < len(smoothed_texts) else None
-            if text is None:
-                text = format_speed_text(mph_val, decimals=export_speed_decimals)
+            text = format_speed_text(mph_val, decimals=export_speed_decimals)
             last_text_value["text"] = text
             return text
 
