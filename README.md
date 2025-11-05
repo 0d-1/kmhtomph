@@ -59,4 +59,4 @@ kmhtomph/
 
 ## Licence
 
-Ce dépôt ne contient pas encore d’information de licence. Ajoutez un fichier `LICENSE` si vous souhaitez distribuer l’application publiquement.
+Ce dépôt ne contient pas d’information de licence.
