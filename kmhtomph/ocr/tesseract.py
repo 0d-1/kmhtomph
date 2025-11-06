@@ -233,8 +233,20 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
     return cropped if cropped.size else img
 
 
-def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
+def _run_tesseract_prepared(
+    thr: np.ndarray, p: TesseractParams, *, flipped: bool = False
+) -> Tuple[Optional[str], float, np.ndarray]:
+    try:
+        data = pytesseract.image_to_data(
+            thr, config=_tess_config(p), output_type=Output.DICT
+        )
+    except pytesseract.pytesseract.TesseractError:
+        empty = {"text": [], "conf": []}
+        try:
+            dbg = _render_debug(thr, flipped=flipped, data=empty, txt="", conf=0.0)
+        except Exception:
+            dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR) if thr.ndim == 2 else thr.copy()
+        return None, 0.0, dbg
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
@@ -260,7 +272,7 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
             pass
     conf = (float(np.mean(cvals)) / 100.0) if cvals else 0.0
 
-    dbg = _render_debug(prepared, flipped=flipped, data=data, txt=txt, conf=conf)
+    dbg = _render_debug(thr, flipped=flipped, data=data, txt=txt, conf=conf)
     return (txt if txt else None), conf, dbg
 
 
