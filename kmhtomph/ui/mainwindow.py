@@ -5,7 +5,7 @@ barre de progression + raccourcis, extraction ROI par homographie exacte.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, fields
 import time
 from typing import Optional, List
 
@@ -33,7 +33,7 @@ from ..constants import (
     AntiJitterConfig,
 )
 from ..ocr import OCRPipeline
-from ..ocr.tesseract import auto_locate_tesseract
+from ..ocr.tesseract import auto_locate_tesseract, TesseractParams
 from ..video.io import VideoReader
 from ..video.exporter import export_video, ExportParams
 from ..video.overlay import OverlayStyle, draw_speed_overlay, format_speed_text
@@ -117,6 +117,8 @@ class MainWindow(QMainWindow):
             self._settings.value("range/end_sec"),
             0.0,
         )
+
+        self._load_tesseract_params()
 
         self._tesseract_path: Optional[str] = None
         stored_path = self._settings.value("tesseract/path", type=str)
@@ -1566,10 +1568,21 @@ class MainWindow(QMainWindow):
         self.lbl_time.setText(f"{self._format_hms(cur_ms/1000.0)} / {self._format_hms(total_seconds)}")
 
     def _on_settings(self):
-        dlg = SettingsDialog(self, initial_path=self._tesseract_path)
+        dlg = SettingsDialog(
+            self,
+            initial_path=self._tesseract_path,
+            initial_params=self.ocr.tesseract_params,
+        )
         if dlg.exec_():
             prev_path = self._tesseract_path
+            prev_params = self.ocr.tesseract_params
             self._tesseract_path = dlg.tesseract_path or None
+            self.ocr.tesseract_params = dlg.tesseract_params
+            params_changed = self.ocr.tesseract_params != prev_params
+
+            if params_changed:
+                self._save_tesseract_params()
+
             if not self._apply_tesseract_path():
                 self._tesseract_path = prev_path
                 self._apply_tesseract_path(initial=True)
@@ -1602,6 +1615,34 @@ class MainWindow(QMainWindow):
             self._settings.setValue("tesseract/path", self._tesseract_path)
         else:
             self._settings.remove("tesseract/path")
+        self._settings.sync()
+
+    def _load_tesseract_params(self) -> None:
+        params = self.ocr.tesseract_params
+        updates: dict[str, object] = {}
+        for f in fields(TesseractParams):
+            key = f"tesseract/params/{f.name}"
+            current = getattr(params, f.name)
+            if isinstance(current, bool):
+                val = self._settings.value(key, None, type=bool)
+            elif isinstance(current, int):
+                val = self._settings.value(key, None, type=int)
+            elif isinstance(current, str):
+                val = self._settings.value(key, None, type=str)
+            else:
+                val = None
+
+            if val is not None:
+                updates[f.name] = val
+
+        if updates:
+            self.ocr.tesseract_params = replace(params, **updates)
+
+    def _save_tesseract_params(self) -> None:
+        params = self.ocr.tesseract_params
+        for f in fields(TesseractParams):
+            key = f"tesseract/params/{f.name}"
+            self._settings.setValue(key, getattr(params, f.name))
         self._settings.sync()
 
     def _handle_tesseract_error(self, err: Exception) -> None:
