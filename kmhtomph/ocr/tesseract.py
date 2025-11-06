@@ -10,15 +10,15 @@ import sys
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output, TesseractError
+from pytesseract import Output
 
 
 @dataclass(frozen=True)
 class TesseractParams:
     # Prétraitements
-    denoise_bilateral: bool = False
-    clahe: bool = False
-    unsharp: bool = False
+    denoise_bilateral: bool = True
+    clahe: bool = True
+    unsharp: bool = True
 
     # Mise à l’échelle
     scale_to_height: int = 120
@@ -32,17 +32,6 @@ class TesseractParams:
     # Morphologie
     morph_open: bool = True
     morph_close: bool = True
-
-    # Combinaisons supplémentaires
-    try_psm8: bool = True
-    try_psm6: bool = False
-    try_larger_scale: bool = False
-    try_without_morphology: bool = False
-
-    # Variantes binaires
-    try_adaptive_if_blank: bool = True
-    try_raw_binarize: bool = False
-    try_complementary_morph: bool = False
 
 
 DEFAULT_PARAMS = TesseractParams()
@@ -245,15 +234,7 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
 
 
 def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    try:
-        data = pytesseract.image_to_data(
-            thr,
-            config=_tess_config(p),
-            output_type=Output.DICT,
-        )
-    except TesseractError:
-        dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
-        return None, 0.0, dbg
+    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
@@ -343,36 +324,35 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
         if thr_main.size:
             _record_candidate(thr_main)
 
-            if p.try_adaptive_if_blank and _looks_mostly_blank(thr_main):
+            if _looks_mostly_blank(thr_main):
                 thr_adapt = _adaptive_binarize(gray_proc, p)
                 _record_candidate(thr_adapt)
 
         if gray_proc.size == 0:
             continue
 
-        if p.try_raw_binarize:
-            raw_thr = _binarize(gray_proc)
-            _record_candidate(raw_thr)
+        raw_thr = _binarize(gray_proc)
+        _record_candidate(raw_thr)
 
-            if p.try_complementary_morph and p.morph_open != p.morph_close:
-                # Dans les cas où une seule opération morphologique est active,
-                # proposer aussi la variante complémentaire.
-                if p.morph_close:
-                    open_variant = cv2.morphologyEx(
-                        raw_thr,
-                        cv2.MORPH_OPEN,
-                        np.ones((2, 2), np.uint8),
-                        iterations=1,
-                    )
-                    _record_candidate(open_variant)
-                if p.morph_open:
-                    close_variant = cv2.morphologyEx(
-                        raw_thr,
-                        cv2.MORPH_CLOSE,
-                        np.ones((2, 2), np.uint8),
-                        iterations=1,
-                    )
-                    _record_candidate(close_variant)
+        if p.morph_open != p.morph_close:
+            # Dans les cas où une seule opération morphologique est active,
+            # proposer aussi la variante complémentaire.
+            if p.morph_close:
+                open_variant = cv2.morphologyEx(
+                    raw_thr,
+                    cv2.MORPH_OPEN,
+                    np.ones((2, 2), np.uint8),
+                    iterations=1,
+                )
+                _record_candidate(open_variant)
+            if p.morph_open:
+                close_variant = cv2.morphologyEx(
+                    raw_thr,
+                    cv2.MORPH_CLOSE,
+                    np.ones((2, 2), np.uint8),
+                    iterations=1,
+                )
+                _record_candidate(close_variant)
 
     if not aggregated:
         return None, 0.0, fallback_dbg
@@ -400,8 +380,9 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
 def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = None) -> Tuple[Optional[str], float, np.ndarray]:
     """
     OCR Tesseract avec plusieurs variantes/fallbacks. Retourne (texte, confiance, image_debug).
-    Les combinaisons balayées privilégient quelques variations ciblées configurables pour
-    limiter le temps de traitement tout en conservant une couverture des cas difficiles.
+    Les combinaisons balayées privilégient les variations légères (PSM 7/8/6, upscale à 140 px,
+    et désactivation de la morphologie) pour limiter le temps de traitement tout en conservant
+    une bonne couverture des cas difficiles.
     """
     g = _make_gray(bgr_or_gray)
     p0 = params if params is not None else DEFAULT_PARAMS
@@ -409,29 +390,14 @@ def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = N
     best: Tuple[Optional[str], float, Optional[np.ndarray]] = (None, 0.0, None)
     threshold = 0.85  # si on dépasse, on “early return”
 
-    combos: List[TesseractParams] = []
-
-    def _add_combo(cfg: TesseractParams) -> None:
-        for existing in combos:
-            if existing == cfg:
-                return
-        combos.append(cfg)
-
-    _add_combo(p0)
-
-    if p0.try_psm8 and int(p0.psm) != 8:
-        _add_combo(replace(p0, psm=8))
-
-    if p0.try_psm6 and int(p0.psm) != 6:
-        _add_combo(replace(p0, psm=6))
-
-    if p0.try_larger_scale:
-        alt_scale = max(140, int(p0.scale_to_height))
-        if alt_scale != int(p0.scale_to_height):
-            _add_combo(replace(p0, scale_to_height=alt_scale))
-
-    if p0.try_without_morphology and (p0.morph_open or p0.morph_close):
-        _add_combo(replace(p0, morph_open=False, morph_close=False))
+    # Essai principal
+    combos = [
+        p0,
+        replace(p0, psm=(7 if int(p0.psm) != 7 else 8)),
+        replace(p0, psm=6),
+        replace(p0, scale_to_height=max(140, int(p0.scale_to_height))),
+        replace(p0, morph_open=False, morph_close=False),
+    ]
 
     for p in combos:
         t, c, dbg = _finalize_and_try(g, p)
