@@ -10,7 +10,7 @@ import sys
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output
+from pytesseract import Output, TesseractError
 
 
 @dataclass(frozen=True)
