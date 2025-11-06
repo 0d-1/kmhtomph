@@ -233,7 +233,9 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
     return cropped if cropped.size else img
 
 
-def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
+def _run_tesseract_prepared(
+    thr: np.ndarray, p: TesseractParams, *, flipped: bool = False
+) -> Tuple[Optional[str], float, np.ndarray]:
     data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
 
     # Extraire texte brut + confiance
@@ -260,7 +262,7 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
             pass
     conf = (float(np.mean(cvals)) / 100.0) if cvals else 0.0
 
-    dbg = _render_debug(prepared, flipped=flipped, data=data, txt=txt, conf=conf)
+    dbg = _render_debug(thr, flipped=flipped, data=data, txt=txt, conf=conf)
     return (txt if txt else None), conf, dbg
 
 
