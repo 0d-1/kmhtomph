@@ -327,7 +327,7 @@ def _run_tesseract_prepared(
             pass
     conf = (float(np.mean(cvals)) / 100.0) if cvals else 0.0
 
-    dbg = _render_debug(prepared, flipped=flipped, data=data, txt=txt, conf=conf)
+    dbg = _render_debug(thr, flipped=flipped, data=data, txt=txt, conf=conf)
     return (txt if txt else None), conf, dbg
 
 
