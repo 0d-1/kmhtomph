@@ -10,7 +10,7 @@ import sys
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output
+from pytesseract import Output, TesseractError
 
 
 @dataclass(frozen=True)
@@ -233,10 +233,75 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
     return cropped if cropped.size else img
 
 
+def _render_debug(
+    prepared: np.ndarray,
+    *,
+    flipped: bool,
+    data: Optional[Dict[str, Any]],
+    txt: Optional[str],
+    conf: float,
+) -> np.ndarray:
+    dbg = cv2.cvtColor(prepared, cv2.COLOR_GRAY2BGR)
+
+    if data:
+        n = len(data.get("text", []))
+        left = data.get("left", [])
+        top = data.get("top", [])
+        width = data.get("width", [])
+        height = data.get("height", [])
+        confs = data.get("conf", [])
+
+        for i in range(n):
+            try:
+                ci = float(confs[i])
+            except Exception:
+                ci = -1.0
+            if ci < 0:
+                continue
+            x = int(left[i])
+            y = int(top[i])
+            w = int(width[i])
+            h = int(height[i])
+            cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 180, 0), 1)
+
+    annotations: List[str] = []
+    if flipped:
+        annotations.append("inv")
+    if txt:
+        annotations.append(txt)
+    if conf > 0:
+        annotations.append(f"{conf * 100:.0f}%")
+
+    if annotations:
+        label = " · ".join(annotations)
+        origin = (4, max(14, dbg.shape[0] - 6))
+        cv2.putText(
+            dbg,
+            label,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (40, 40, 40),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return dbg
+
+
 def _run_tesseract_prepared(
-    thr: np.ndarray, p: TesseractParams, *, flipped: bool = False
+    prepared: np.ndarray, p: TesseractParams, *, flipped: bool
 ) -> Tuple[Optional[str], float, np.ndarray]:
-    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
+    data: Optional[Dict[str, Any]] = None
+    try:
+        data = pytesseract.image_to_data(
+            prepared,
+            config=_tess_config(p),
+            output_type=Output.DICT,
+        )
+    except TesseractError:
+        dbg = _render_debug(prepared, flipped=flipped, data=data, txt=None, conf=0.0)
+        return None, 0.0, dbg
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
