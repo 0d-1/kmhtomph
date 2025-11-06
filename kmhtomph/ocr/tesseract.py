@@ -168,7 +168,7 @@ def _prep_for_ocr(gray_in: np.ndarray, p: TesseractParams) -> Tuple[np.ndarray, 
     # upscale
     h = max(int(p.scale_to_height), 24)
     H, W = g.shape[:2]
-    fx = h / max(1, H)
+    fx = max(1.0, h / max(1, H))
     g = cv2.resize(g, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
 
     # filtres
@@ -244,15 +244,74 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
     return cropped if cropped.size else img
 
 
-def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
+def _render_debug(
+    prepared: np.ndarray,
+    *,
+    flipped: bool,
+    data: Optional[Dict[str, Any]],
+    txt: Optional[str],
+    conf: float,
+) -> np.ndarray:
+    dbg = cv2.cvtColor(prepared, cv2.COLOR_GRAY2BGR)
+
+    if data:
+        n = len(data.get("text", []))
+        left = data.get("left", [])
+        top = data.get("top", [])
+        width = data.get("width", [])
+        height = data.get("height", [])
+        confs = data.get("conf", [])
+
+        for i in range(n):
+            try:
+                ci = float(confs[i])
+            except Exception:
+                ci = -1.0
+            if ci < 0:
+                continue
+            x = int(left[i])
+            y = int(top[i])
+            w = int(width[i])
+            h = int(height[i])
+            cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 180, 0), 1)
+
+    annotations: List[str] = []
+    if flipped:
+        annotations.append("inv")
+    if txt:
+        annotations.append(txt)
+    if conf > 0:
+        annotations.append(f"{conf * 100:.0f}%")
+
+    if annotations:
+        label = " · ".join(annotations)
+        origin = (4, max(14, dbg.shape[0] - 6))
+        cv2.putText(
+            dbg,
+            label,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (40, 40, 40),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return dbg
+
+
+def _run_tesseract_prepared(
+    prepared: np.ndarray, p: TesseractParams, *, flipped: bool
+) -> Tuple[Optional[str], float, np.ndarray]:
+    data: Optional[Dict[str, Any]] = None
     try:
         data = pytesseract.image_to_data(
-            thr,
+            prepared,
             config=_tess_config(p),
             output_type=Output.DICT,
         )
     except TesseractError:
-        dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+        dbg = _render_debug(prepared, flipped=flipped, data=data, txt=None, conf=0.0)
         return None, 0.0, dbg
 
     # Extraire texte brut + confiance
@@ -279,7 +338,7 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
             pass
     conf = (float(np.mean(cvals)) / 100.0) if cvals else 0.0
 
-    dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+    dbg = _render_debug(prepared, flipped=flipped, data=data, txt=txt, conf=conf)
     return (txt if txt else None), conf, dbg
 
 
@@ -321,13 +380,13 @@ def _finalize_and_try(gray_in: np.ndarray, p: TesseractParams) -> Tuple[Optional
     def _record_candidate(thr_variant: np.ndarray) -> None:
         if thr_variant is None or thr_variant.size == 0:
             return
-        prepared, _ = _prepare_for_tesseract(thr_variant)
+        prepared, flipped = _prepare_for_tesseract(thr_variant)
         sig = prepared.tobytes()
         if sig in seen:
             return
         seen.add(sig)
 
-        txt, conf, dbg = _run_tesseract_prepared(prepared, p)
+        txt, conf, dbg = _run_tesseract_prepared(prepared, p, flipped=flipped)
         key = txt if txt else ""
         info = aggregated.setdefault(
             key,
