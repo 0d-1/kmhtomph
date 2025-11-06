@@ -1622,13 +1622,16 @@ class MainWindow(QMainWindow):
         updates: dict[str, object] = {}
         for f in fields(TesseractParams):
             key = f"tesseract/params/{f.name}"
+            if not self._settings.contains(key):
+                continue
+
             current = getattr(params, f.name)
             if isinstance(current, bool):
-                val = self._settings.value(key, None, type=bool)
+                val = self._settings.value(key, current, type=bool)
             elif isinstance(current, int):
-                val = self._settings.value(key, None, type=int)
+                val = self._settings.value(key, current, type=int)
             elif isinstance(current, str):
-                val = self._settings.value(key, None, type=str)
+                val = self._settings.value(key, current, type=str)
             else:
                 val = None
 
