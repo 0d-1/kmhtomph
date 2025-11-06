@@ -10,7 +10,7 @@ import sys
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output
+from pytesseract import Output, TesseractError
 
 
 @dataclass(frozen=True)
@@ -245,7 +245,15 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
 
 
 def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
+    try:
+        data = pytesseract.image_to_data(
+            thr,
+            config=_tess_config(p),
+            output_type=Output.DICT,
+        )
+    except TesseractError:
+        dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+        return None, 0.0, dbg
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
