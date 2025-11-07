@@ -178,18 +178,51 @@ def _extract_numeric_text(data: dict, allow_decimal: bool) -> Optional[str]:
     return best.replace(",", ".") if allow_decimal else best
 
 
-def _average_confidence(data: dict) -> float:
-    confs = []
-    for c in data.get("conf", []):
+def _extract_confidences(values) -> list[float]:
+    confs: list[float] = []
+    for raw in values:
         try:
-            val = float(c)
+            val = float(raw)
         except (TypeError, ValueError):
             continue
         if val >= 0:
             confs.append(val)
+    return confs
+
+
+def _average_confidence(data: dict) -> float:
+    confs = _extract_confidences(data.get("conf", []))
     if not confs:
         return 0.0
     return float(sum(confs) / len(confs)) / 100.0
+
+
+def _numeric_token_confidence(data: dict) -> float:
+    texts = data.get("text", [])
+    confs = data.get("conf", [])
+    if not isinstance(texts, list) or not isinstance(confs, list):
+        return 0.0
+
+    digit_confs: list[float] = []
+    for raw_txt, raw_conf in zip(texts, confs):
+        if not isinstance(raw_txt, str):
+            continue
+        txt = raw_txt.strip()
+        if not txt:
+            continue
+        if not re.search(r"\d", txt):
+            continue
+        try:
+            conf_val = float(raw_conf)
+        except (TypeError, ValueError):
+            continue
+        if conf_val >= 0:
+            digit_confs.append(conf_val)
+
+    if digit_confs:
+        return float(sum(digit_confs) / len(digit_confs)) / 100.0
+
+    return _average_confidence(data)
 
 
 def _render_debug(prepared: np.ndarray, data: dict, text: Optional[str], conf: float) -> np.ndarray:
@@ -262,6 +295,6 @@ def tesseract_ocr(
         return None, 0.0, dbg
 
     text = _extract_numeric_text(data, params.allow_decimal)
-    confidence = _average_confidence(data)
+    confidence = _numeric_token_confidence(data)
     dbg = _render_debug(prepared, data, text, confidence)
     return text, confidence, dbg
