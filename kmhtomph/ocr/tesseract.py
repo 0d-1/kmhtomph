@@ -29,7 +29,10 @@ class TesseractParams:
     oem: int = 1
     scale_to_height: int = 120
     allow_decimal: bool = False
-    whitelist: str = "0123456789"
+    # Autorise les chiffres ainsi que les caractères d'unités fréquents
+    # (km/h, mph) pour éviter que Tesseract ne rejette toute la ligne quand
+    # l'affichage contient la vitesse suivie de son unité collée.
+    whitelist: str = "0123456789kmhKMHmphMPH/ "
     tessdata_dir: Optional[str] = None
 
 
@@ -156,10 +159,20 @@ def _extract_numeric_text(data: dict, allow_decimal: bool) -> Optional[str]:
         return None
 
     joined = " ".join(texts)
+
+    # Nettoie le flux reconnu pour conserver uniquement les chiffres et les
+    # séparateurs décimaux, tout en fusionnant les chiffres que Tesseract aurait
+    # segmentés en tokens distincts ("1 7 6" -> "176").
+    sanitized = re.sub(r"[^0-9.,]", " ", joined)
+    sanitized = re.sub(r"(?<=\d)\s+(?=\d)", "", sanitized)
+    sanitized = re.sub(r"(?<=\d)\s+(?=[.,])", "", sanitized)
+    sanitized = re.sub(r"(?<=[.,])\s+(?=\d)", "", sanitized)
+
     pattern = r"[0-9]+(?:[.,][0-9]+)?" if allow_decimal else r"[0-9]+"
-    matches = re.findall(pattern, joined)
+    matches = re.findall(pattern, sanitized)
     if not matches:
-        return None
+        digits_only = re.sub(r"\D", "", joined)
+        return digits_only or None
 
     best = max(matches, key=len)
     return best.replace(",", ".") if allow_decimal else best
