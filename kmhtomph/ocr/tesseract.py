@@ -32,7 +32,7 @@ class TesseractParams:
     # Autorise les chiffres ainsi que les caractères d'unités fréquents
     # (km/h, mph) pour éviter que Tesseract ne rejette toute la ligne quand
     # l'affichage contient la vitesse suivie de son unité collée.
-    whitelist: str = "0123456789kmhKMHmphMPH/ "
+    whitelist: str = "0123456789"
     tessdata_dir: Optional[str] = None
 
 
@@ -220,7 +220,12 @@ def _numeric_token_confidence(data: dict) -> float:
             digit_confs.append(conf_val)
 
     if digit_confs:
-        return float(sum(digit_confs) / len(digit_confs)) / 100.0
+        # Les chiffres pertinents sont parfois entourés de bribes mal reconnues
+        # (unités, artéfacts) qui tirent la moyenne vers le bas. En se basant sur
+        # la meilleure confiance parmi les tokens réellement numériques, on
+        # valorise la portion utile du texte tout en restant cohérent avec
+        # l'échelle [0..1].
+        return float(max(digit_confs)) / 100.0
 
     return _average_confidence(data)
 
