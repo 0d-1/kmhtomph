@@ -32,7 +32,7 @@ class TesseractParams:
     # Autorise les chiffres ainsi que les caractères d'unités fréquents
     # (km/h, mph) pour éviter que Tesseract ne rejette toute la ligne quand
     # l'affichage contient la vitesse suivie de son unité collée.
-    whitelist: str = "0123456789kmhKMHmphMPH/ "
+    whitelist: str = "0123456789"
     tessdata_dir: Optional[str] = None
 
 
