@@ -10,24 +10,24 @@ import sys
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output
+from pytesseract import Output, TesseractError, TesseractNotFoundError
 
 
 @dataclass(frozen=True)
 class TesseractParams:
+    # Tesseract de base (utilisé par l'UI de configuration)
+    lang: str = "eng"
+    psm: int = 7  # single line
+    oem: int = 3  # default LSTM
+    scale_to_height: int = 120
+    allow_decimal: bool = False  # pour "12.3"
+    whitelist: str = "0123456789"
+    tessdata_dir: Optional[str] = None
+
     # Prétraitements
     denoise_bilateral: bool = True
     clahe: bool = True
     unsharp: bool = True
-
-    # Mise à l’échelle
-    scale_to_height: int = 120
-
-    # Tesseract
-    psm: int = 7  # single line
-    oem: int = 3  # default LSTM
-    allow_dot: bool = False  # pour "12.3"
-    whitelist: str = "0123456789"
 
     # Morphologie
     morph_open: bool = True
@@ -234,7 +234,21 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
 
 
 def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
+    config = _tess_config(p)
+    lang = p.lang.strip() or DEFAULT_PARAMS.lang
+
+    try:
+        data = pytesseract.image_to_data(
+            thr,
+            lang=lang,
+            config=config,
+            output_type=Output.DICT,
+        )
+    except TesseractNotFoundError:
+        raise
+    except TesseractError:
+        dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+        return None, 0.0, dbg
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
@@ -243,7 +257,7 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
     txt_raw = txt_raw.strip()
 
     # Nettoyage : garder digits + point si autorisé
-    if p.allow_dot:
+    if p.allow_decimal:
         m = re.findall(r"[0-9]+(?:[.,][0-9])?", txt_raw)
     else:
         m = re.findall(r"[0-9]+", txt_raw)
@@ -265,7 +279,12 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
 
 
 def _tess_config(p: TesseractParams) -> str:
-    wl = p.whitelist + (".," if p.allow_dot else "")
+    wl_base = p.whitelist or ""
+    wl = wl_base
+    if p.allow_decimal:
+        for ch in ".,":
+            if ch not in wl:
+                wl += ch
     config_parts = [
         f"--psm {int(p.psm)}",
         f"--oem {int(p.oem)}",
@@ -274,6 +293,8 @@ def _tess_config(p: TesseractParams) -> str:
         "-c load_system_dawg=0",
         "-c load_freq_dawg=0",
     ]
+    if p.tessdata_dir:
+        config_parts.append(f'--tessdata-dir "{p.tessdata_dir}"')
     return " ".join(config_parts)
 
 
