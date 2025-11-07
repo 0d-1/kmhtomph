@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
         self.overlay_style = OverlayStyle()
         self._last_overlay_text: Optional[str] = None
         self._loading_overlay_settings = False
+        self._overlay_preview_display: Optional[str] = None
+        self._overlay_preview_style: Optional[OverlayStyle] = None
         self.show_debug_thumb = DEFAULT_SHOW_DEBUG_THUMB
         self.debug_thumb_size = DEFAULT_DEBUG_THUMB_SIZE
         self._last_debug_bgr: Optional[np.ndarray] = None
@@ -1252,7 +1254,16 @@ class MainWindow(QMainWindow):
                 display = self._last_overlay_text
                 if display is None and allow_placeholder:
                     display = "-- mph"
-        self.canvas.set_overlay_preview(display, self.overlay_style)
+        current_style = self.overlay_style
+        if (
+            display == self._overlay_preview_display
+            and current_style == self._overlay_preview_style
+        ):
+            return
+
+        self._overlay_preview_display = display
+        self._overlay_preview_style = current_style
+        self.canvas.set_overlay_preview(display, current_style)
 
     @staticmethod
     def _rgba_to_string(rgba: tuple[int, int, int, int]) -> str:
