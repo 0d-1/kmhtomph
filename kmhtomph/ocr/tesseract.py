@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple, List, Dict, Any, Set
 
+import logging
 import re
 import os
 import shutil
@@ -234,7 +235,17 @@ def _crop_to_bounds(img: np.ndarray, bounds: Tuple[int, int, int, int]) -> np.nd
 
 
 def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Optional[str], float, np.ndarray]:
-    data = pytesseract.image_to_data(thr, config=_tess_config(p), output_type=Output.DICT)
+    dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+
+    try:
+        data = pytesseract.image_to_data(
+            thr,
+            config=_tess_config(p),
+            output_type=Output.DICT,
+        )
+    except pytesseract.TesseractError as exc:
+        logger.debug("Tesseract OCR failed: %s", exc)
+        return None, 0.0, dbg
 
     # Extraire texte brut + confiance
     words = data.get("text", [])
@@ -260,7 +271,6 @@ def _run_tesseract_prepared(thr: np.ndarray, p: TesseractParams) -> Tuple[Option
             pass
     conf = (float(np.mean(cvals)) / 100.0) if cvals else 0.0
 
-    dbg = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
     return (txt if txt else None), conf, dbg
 
 
@@ -416,3 +426,6 @@ def tesseract_ocr(bgr_or_gray: np.ndarray, params: Optional[TesseractParams] = N
     if dbg is None:
         dbg = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     return (t if t else None), float(c), dbg
+logger = logging.getLogger(__name__)
+
+
