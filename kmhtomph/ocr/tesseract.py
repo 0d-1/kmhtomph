@@ -29,7 +29,10 @@ class TesseractParams:
     oem: int = 1
     scale_to_height: int = 120
     allow_decimal: bool = False
-    whitelist: str = "0123456789"
+    # Autorise les chiffres ainsi que les caractères d'unités fréquents
+    # (km/h, mph) pour éviter que Tesseract ne rejette toute la ligne quand
+    # l'affichage contient la vitesse suivie de son unité collée.
+    whitelist: str = "0123456789kmhKMHmphMPH/ "
     tessdata_dir: Optional[str] = None
 
 
