@@ -9,6 +9,8 @@ import cv2
 # Import modulaires Qt (meilleur pour les analyseurs & stubs)
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from ..video.overlay import OverlayStyle, render_text_pane_qt
+
 
 def _bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
     """Convertit un BGR OpenCV en QImage RGB888 (copie)."""
@@ -20,12 +22,11 @@ def _bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
 
 class VideoCanvas(QtWidgets.QWidget):
     on_roi_changed = QtCore.pyqtSignal()
+    on_overlay_changed = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._frame_bgr: Optional[np.ndarray] = None
-        self._debug_bgr: Optional[np.ndarray] = None
-
         # ROI : centre, taille, angle (deg)
         self._cx = 200
         self._cy = 150
@@ -33,11 +34,24 @@ class VideoCanvas(QtWidgets.QWidget):
         self._h = 90
         self._angle = 0.0
 
+        # Overlay (zone de sortie)
+        self._overlay_cx = 200
+        self._overlay_cy = 200
+        self._overlay_w = 220
+        self._overlay_h = 80
+        self._overlay_angle = 0.0
+
+        # Aperçu overlay
+        self._overlay_text: Optional[str] = None
+        self._overlay_style: Optional[OverlayStyle] = None
+        self._overlay_qimage: Optional[QtGui.QImage] = None
+
         # Interaction
         self._dragging_move = False
         self._dragging_resize = False
         self._drag_anchor: Tuple[int, int] | None = None
         self._resize_corner = 0  # 0..3
+        self._active_shape = "roi"  # "roi" | "overlay"
 
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
@@ -53,14 +67,6 @@ class VideoCanvas(QtWidgets.QWidget):
     def set_frame(self, frame_bgr: np.ndarray) -> None:
         assert frame_bgr.ndim == 3 and frame_bgr.shape[2] == 3, "frame_bgr doit être BGR HxWx3"
         self._frame_bgr = frame_bgr.copy()
-        self.update()
-
-    def set_debug_thumb(self, debug_bgr: Optional[np.ndarray]) -> None:
-        self._debug_bgr = debug_bgr.copy() if debug_bgr is not None else None
-        self.update()
-
-    def clear_debug_thumb(self) -> None:
-        self._debug_bgr = None
         self.update()
 
     def set_roi(self, cx: int, cy: int, w: int, h: int, angle_deg: float = 0.0) -> None:
@@ -114,6 +120,49 @@ class VideoCanvas(QtWidgets.QWidget):
         pts = (local @ R_clock.T) + np.array([cx, cy], dtype=np.float32)
         return pts  # (4,2) float32
 
+    def set_overlay_rect(self, cx: int, cy: int, w: int, h: int, angle_deg: float = 0.0) -> None:
+        self._overlay_cx, self._overlay_cy = int(cx), int(cy)
+        self._overlay_w, self._overlay_h = int(w), int(h)
+        self._overlay_angle = float(angle_deg)
+        self._normalize_overlay()
+        self.on_overlay_changed.emit()
+        self.update()
+
+    def get_overlay_rect(self) -> tuple[int, int, int, int, float]:
+        return (
+            int(self._overlay_cx),
+            int(self._overlay_cy),
+            int(self._overlay_w),
+            int(self._overlay_h),
+            float(self._overlay_angle),
+        )
+
+    def set_active_shape(self, shape: str) -> None:
+        if shape not in {"roi", "overlay"}:
+            raise ValueError("shape doit être 'roi' ou 'overlay'")
+        if self._active_shape != shape:
+            self._active_shape = shape
+            self.update()
+
+    def active_shape(self) -> str:
+        return self._active_shape
+
+    def set_overlay_preview(self, text: Optional[str], style: Optional[OverlayStyle]) -> None:
+        self._overlay_text = text
+        self._overlay_style = style
+        if text and style:
+            self._overlay_qimage = render_text_pane_qt(text, style)
+        else:
+            self._overlay_qimage = None
+        self.update()
+
+    def refresh_overlay_preview(self) -> None:
+        if self._overlay_text and self._overlay_style:
+            self._overlay_qimage = render_text_pane_qt(self._overlay_text, self._overlay_style)
+        else:
+            self._overlay_qimage = None
+        self.update()
+
     # ------------- Dessin -------------
 
     def paintEvent(self, ev) -> None:
@@ -133,52 +182,65 @@ class VideoCanvas(QtWidgets.QWidget):
         # Transform image -> widget
         sx, sy, ox, oy = self._image_transform()
 
-        # ROI style
-        pen = QtGui.QPen(QtGui.QColor(255, 180, 0), 2, QtCore.Qt.SolidLine)
-        p.setPen(pen)
+        roi_center = (ox + self._cx * sx, oy + self._cy * sy)
+        roi_size = (self._w * sx, self._h * sy)
+        overlay_center = (ox + self._overlay_cx * sx, oy + self._overlay_cy * sy)
+        overlay_size = (self._overlay_w * sx, self._overlay_h * sy)
+
+        # Dessiner ROI
+        roi_color = QtGui.QColor(255, 180, 0)
+        roi_pen = QtGui.QPen(roi_color, 2.5 if self._active_shape == "roi" else 2.0, QtCore.Qt.SolidLine)
+        p.setPen(roi_pen)
         p.setBrush(QtCore.Qt.NoBrush)
+        self._draw_rotated_rect(p, roi_center, roi_size, self._angle, handles=True, color=roi_color)
 
-        # Coord en widget
-        cx = ox + self._cx * sx
-        cy = oy + self._cy * sy
-        w = self._w * sx
-        h = self._h * sy
+        # Dessiner zone overlay
+        overlay_color = QtGui.QColor(90, 210, 255)
+        overlay_pen_style = QtCore.Qt.SolidLine if self._active_shape == "overlay" else QtCore.Qt.DashLine
+        overlay_pen = QtGui.QPen(overlay_color, 2.5 if self._active_shape == "overlay" else 2.0, overlay_pen_style)
+        p.setPen(overlay_pen)
+        p.setBrush(QtCore.Qt.NoBrush)
+        self._draw_rotated_rect(
+            p,
+            overlay_center,
+            overlay_size,
+            self._overlay_angle,
+            handles=False,
+            color=overlay_color,
+        )
 
-        # Rotation autour du centre
-        t = QtGui.QTransform()
-        t.translate(cx, cy)
-        t.rotate(-self._angle)  # Qt est antihoraire -> signe -
-        p.setTransform(t, combine=False)
+        # Dessiner le texte overlay après avoir réinitialisé la transform
+        if self._overlay_qimage is not None and self._overlay_qimage.width() > 0 and self._overlay_qimage.height() > 0:
+            p.save()
+            t = QtGui.QTransform()
+            t.translate(*overlay_center)
+            t.rotate(-self._overlay_angle)
+            p.setTransform(t, combine=False)
 
-        # Rectangle centré (QRectF pour floats)
-        x0 = -w / 2.0
-        y0 = -h / 2.0
-        p.drawRect(QtCore.QRectF(x0, y0, w, h))
+            target_w = max(1.0, overlay_size[0])
+            target_h = max(1.0, overlay_size[1])
+            img_w = float(self._overlay_qimage.width())
+            img_h = float(self._overlay_qimage.height())
+            scale = min(target_w / img_w, target_h / img_h) if img_w > 0 and img_h > 0 else 1.0
+            scale = min(scale, 1.0)
+            scale = max(scale, 1e-3)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+            rect = QtCore.QRectF(-draw_w / 2.0, -draw_h / 2.0, draw_w, draw_h)
+            p.drawImage(rect, self._overlay_qimage)
+            p.restore()
 
-        # Poignées (coins)
-        p.setBrush(QtGui.QBrush(QtGui.QColor(255, 180, 0)))
-        r = 6.0
-        for (px, py) in [(-w/2.0, -h/2.0), (w/2.0, -h/2.0), (w/2.0, h/2.0), (-w/2.0, h/2.0)]:
-            p.drawEllipse(QtCore.QPointF(px, py), r, r)
-
-        # Reset transform
-        p.resetTransform()
-
-        # Vignette debug
-        if self._debug_bgr is not None and self._debug_bgr.size > 0:
-            thumb = _bgr_to_qimage(self._debug_bgr)
-            tw = min(200, max(1, self.width() // 3))
-            th = int(thumb.height() * (tw / max(1, thumb.width())))
-            x = self.width() - tw - 10
-            y = self.height() - th - 10
-
-            p.setOpacity(0.95)
-            p.fillRect(x - 2, y - 2, tw + 4, th + 4, QtGui.QColor(0, 0, 0, 140))
-            p.setOpacity(1.0)
-
-            p.drawImage(
-                x, y,
-                thumb.scaled(tw, th, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation),
+        if self._active_shape == "overlay":
+            handle_pen = QtGui.QPen(overlay_color, 2.5, QtCore.Qt.SolidLine)
+            p.setPen(handle_pen)
+            self._draw_rotated_rect(
+                p,
+                overlay_center,
+                overlay_size,
+                self._overlay_angle,
+                handles=True,
+                color=overlay_color,
+                draw_rect=False,
             )
 
         p.end()
@@ -194,7 +256,7 @@ class VideoCanvas(QtWidgets.QWidget):
         elif ev.button() == QtCore.Qt.RightButton:
             self._dragging_resize = True
             self._drag_anchor = (ev.x(), ev.y())
-            self._resize_corner = self._closest_corner(ev.pos())
+            self._resize_corner = self._closest_corner_for_shape(ev.pos(), self._active_shape)
         self.setCursor(QtCore.Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, ev) -> None:
@@ -208,24 +270,37 @@ class VideoCanvas(QtWidgets.QWidget):
         ddx = dx / max(1e-6, sx)
         ddy = dy / max(1e-6, sy)
 
+        if self._active_shape == "overlay":
+            angle = self._overlay_angle
+        else:
+            angle = self._angle
+
         # rotation inverse pour delta local
-        rad = math.radians(self._angle)
+        rad = math.radians(angle)
         cos, sin = math.cos(rad), math.sin(rad)
         local_dx = cos * ddx + sin * ddy
         local_dy = -sin * ddx + cos * ddy
 
         if self._dragging_move:
-            self._cx += local_dx
-            self._cy += local_dy
+            if self._active_shape == "overlay":
+                self._overlay_cx += local_dx
+                self._overlay_cy += local_dy
+            else:
+                self._cx += local_dx
+                self._cy += local_dy
         elif self._dragging_resize:
             kx = 1 if self._resize_corner in (1, 2) else -1
             ky = 1 if self._resize_corner in (2, 3) else -1
-            self._w += kx * 2 * local_dx
-            self._h += ky * 2 * local_dy
+            if self._active_shape == "overlay":
+                self._overlay_w += kx * 2 * local_dx
+                self._overlay_h += ky * 2 * local_dy
+            else:
+                self._w += kx * 2 * local_dx
+                self._h += ky * 2 * local_dy
 
         self._drag_anchor = (ev.x(), ev.y())
-        self._normalize_roi()
-        self.on_roi_changed.emit()
+        self._normalize_shape(self._active_shape)
+        self._emit_shape_changed(self._active_shape)
         self.update()
 
     def mouseReleaseEvent(self, ev) -> None:
@@ -237,17 +312,23 @@ class VideoCanvas(QtWidgets.QWidget):
     def wheelEvent(self, ev) -> None:
         step = 1.0 if (ev.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier)) else 3.0
         delta = ev.angleDelta().y() / 120.0
-        self._angle = (self._angle + delta * step) % 360.0
-        self.on_roi_changed.emit()
+        if self._active_shape == "overlay":
+            self._overlay_angle = (self._overlay_angle + delta * step) % 360.0
+        else:
+            self._angle = (self._angle + delta * step) % 360.0
+        self._emit_shape_changed(self._active_shape)
         self.update()
 
     def mouseDoubleClickEvent(self, ev) -> None:
         sx, sy, ox, oy = self._image_transform()
         ix = (ev.x() - ox) / max(1e-6, sx)
         iy = (ev.y() - oy) / max(1e-6, sy)
-        self._cx, self._cy = ix, iy
-        self._normalize_roi()
-        self.on_roi_changed.emit()
+        if self._active_shape == "overlay":
+            self._overlay_cx, self._overlay_cy = ix, iy
+        else:
+            self._cx, self._cy = ix, iy
+        self._normalize_shape(self._active_shape)
+        self._emit_shape_changed(self._active_shape)
         self.update()
 
     # ------------- Helpers internes -------------
@@ -276,14 +357,83 @@ class VideoCanvas(QtWidgets.QWidget):
         self._cx = float(max(0, min(self._cx, w)))
         self._cy = float(max(0, min(self._cy, h)))
 
+    def _normalize_overlay(self) -> None:
+        if self._frame_bgr is None:
+            return
+        h, w = self._frame_bgr.shape[:2]
+        self._overlay_w = max(10, min(self._overlay_w, w))
+        self._overlay_h = max(10, min(self._overlay_h, h))
+        self._overlay_cx = float(max(0, min(self._overlay_cx, w)))
+        self._overlay_cy = float(max(0, min(self._overlay_cy, h)))
+
+    def _normalize_shape(self, shape: str) -> None:
+        if shape == "overlay":
+            self._normalize_overlay()
+        else:
+            self._normalize_roi()
+
+    def _emit_shape_changed(self, shape: str) -> None:
+        if shape == "overlay":
+            self.on_overlay_changed.emit()
+        else:
+            self.on_roi_changed.emit()
+
     def _closest_corner(self, pos) -> int:
         """Renvoie l'index du coin le plus proche dans l'espace écran (0..3)."""
+        return self._closest_corner_for_shape(pos, self._active_shape)
+
+    # ------------- Helpers internes -------------
+
+    def _draw_rotated_rect(
+        self,
+        painter: QtGui.QPainter,
+        center: Tuple[float, float],
+        size: Tuple[float, float],
+        angle_deg: float,
+        *,
+        handles: bool,
+        color: QtGui.QColor,
+        draw_rect: bool = True,
+    ) -> None:
+        w, h = size
+        if w <= 0 or h <= 0:
+            return
+        painter.save()
+        t = QtGui.QTransform()
+        t.translate(center[0], center[1])
+        t.rotate(-angle_deg)
+        painter.setTransform(t, combine=False)
+        rect = QtCore.QRectF(-w / 2.0, -h / 2.0, w, h)
+        if draw_rect:
+            painter.drawRect(rect)
+        if handles:
+            painter.setBrush(QtGui.QBrush(color))
+            r = 6.0
+            for (px, py) in [
+                (-w / 2.0, -h / 2.0),
+                (w / 2.0, -h / 2.0),
+                (w / 2.0, h / 2.0),
+                (-w / 2.0, h / 2.0),
+            ]:
+                painter.drawEllipse(QtCore.QPointF(px, py), r, r)
+            painter.setBrush(QtCore.Qt.NoBrush)
+        painter.restore()
+
+    def _closest_corner_for_shape(self, pos, shape: str) -> int:
         sx, sy, ox, oy = self._image_transform()
-        cx = ox + self._cx * sx
-        cy = oy + self._cy * sy
-        w = self._w * sx
-        h = self._h * sy
-        rad = math.radians(self._angle)
+        if shape == "overlay":
+            cx = ox + self._overlay_cx * sx
+            cy = oy + self._overlay_cy * sy
+            w = self._overlay_w * sx
+            h = self._overlay_h * sy
+            angle = self._overlay_angle
+        else:
+            cx = ox + self._cx * sx
+            cy = oy + self._cy * sy
+            w = self._w * sx
+            h = self._h * sy
+            angle = self._angle
+        rad = math.radians(angle)
         cos, sin = math.cos(rad), math.sin(rad)
         corners = [(-w/2, -h/2), (w/2, -h/2), (w/2, h/2), (-w/2, h/2)]
         pts = []
